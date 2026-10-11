@@ -12,9 +12,11 @@ ROOT=Path(__file__).resolve().parents[3]
 def validate_config(cfg):
     expected={'batch_size':16,'gradient_accumulation_steps':1,'max_steps':30000,
         'save_every':5000,'learning_rate':1e-4,'weight_decay':.01,'mixed_precision':'bf16',
-        'seed':42,'resume':None,'lr_scheduler_type':'cosine'}
+        'seed':42,'resume':None,'lr_scheduler_type':'cosine','eval_every':0}
     if any(cfg.get(k)!=v for k,v in expected.items()):
         raise ValueError('Exact B16/accum1/30000 original recipe required')
+    if cfg['data'].get('val') is not None:
+        raise ValueError('The inherited recipe has no separate validation split')
     m=cfg['model'];d=cfg['data']['train']
     if (m['_target_']!='fastwam.forcewm.runtime.create_fastwam_forcewm'
             or d['_target_']!='fastwam.forcewm.data.ForceWMCachedDataset'
@@ -30,6 +32,17 @@ def helpers():
     spec=importlib.util.spec_from_file_location('baseline_probe_helpers',ROOT/'scripts/forcevla/preflight_cached_gpu.py')
     mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
     return mod
+
+
+def build_probe_datasets(data_cfg):
+    """Preserve the stock no-split contract: val aliases the training object."""
+    from fastwam import runtime
+    if data_cfg.get('val') is not None:
+        raise ValueError('The inherited recipe has no separate validation split')
+    train_ds, val_ds = runtime.build_datasets(data_cfg)
+    if val_ds is not train_ds:
+        raise RuntimeError('Stock no-split validation must alias the training dataset')
+    return train_ds, val_ds
 
 
 def execute(config_path,output):
@@ -64,10 +77,9 @@ def execute(config_path,output):
         if module is not None:
             for name in ('encode','decode'):
                 if hasattr(module,name):setattr(module,name,forbidden)
-    train_ds,val_ds=runtime.build_datasets(cfg.data)
-    if val_ds is not None:raise RuntimeError('Baseline has no invented validation split')
+    train_ds,val_ds=build_probe_datasets(cfg.data)
     dataset_receipt=train_ds.audit_integrity()
-    trainer=Wan22Trainer(model,train_ds,None,cfg=cfg)
+    trainer=Wan22Trainer(model,train_ds,val_ds,cfg=cfg)
     engine=trainer.model
     zero=trainer.accelerator.state.deepspeed_plugin.deepspeed_config['zero_optimization']
     if (zero['stage']!=1 or engine.train_micro_batch_size_per_gpu()!=16
