@@ -1,0 +1,8 @@
+defaults:
+  - forcevla_libero_2cam_cached
+  - _self_
+
+train:
+  _target_: fastwam.forcewm.data.ForceWMCachedDataset
+  dataset_stats_path: ./data/forcevla_fastwam/shared_stats/dataset_stats.json
+  sidecar_root: null

@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - forcevla_libero_2cam_cached_4gpu_30k
+  - override /data: forcevla_libero_2cam_cached_forcewm
+  - override /model: fastwam_forcewm
+  - _self_
+
+# Four ranks x B16 x accumulation1 = global64. Full 30k schedule.
+batch_size: 16
+gradient_accumulation_steps: 1
+max_steps: 30000
+save_every: 5000
+resume: null
+model:
+  lambda_force: 1.0
+  generated_video_steps: 16
+  checkpoint_force_layers: true

@@ -1,0 +1,16 @@
+defaults:
+  - fastwam_baseline
+  - _self_
+
+_target_: fastwam.forcewm.runtime.create_fastwam_forcewm
+force_init_seed: 43
+memory_seed: 44
+generated_video_steps: 16
+lambda_force: 1.0
+checkpoint_force_layers: true
+force_hidden_dim: 1280
+force_ffn_dim: 4608
+force_num_heads: 16
+memory_attention_width: 512
+memory_heads: 8
+compile_training_denoise: false
