@@ -10,29 +10,36 @@ from datetime import datetime,timezone
 from process_ownership import ProcessOwnership
 
 
-def execute(command,cwd,output,seconds):
-    if not 1<=seconds<=3600:raise ValueError('Probe must be bounded to at most one hour')
+def execute(command,cwd,output,seconds,*,maximum_seconds=3600,deadline_unix=None,log_name='probe.log',phase='forcewm-two-adam'):
+    if not 1<=seconds<=maximum_seconds<=144000:raise ValueError('Execution exceeds its bounded time allowance')
+    if deadline_unix is not None:
+        seconds=min(seconds,deadline_unix-time.time()-60)
+        if seconds<1:raise ValueError('Absolute deadline has no execution and cleanup time remaining')
     output=Path(output);output.mkdir(parents=True,exist_ok=False)
     end=time.monotonic()+seconds;tracker=ProcessOwnership();child=None;pending=[]
     handlers={s:signal.getsignal(s) for s in (signal.SIGINT,signal.SIGTERM)}
     result={'status':'starting','started_at':datetime.now(timezone.utc).isoformat(),'command':command,'limit_seconds':seconds}
     def save():
         temp=output/'status.tmp';temp.write_text(json.dumps(result,indent=2));temp.replace(output/'status.json')
+    def cleanup_deadline():
+        return end+60 if deadline_unix is None else min(end+60,time.monotonic()+max(0,deadline_unix-time.time()))
+    result['absolute_deadline_unix']=deadline_unix
     try:
         for s in handlers:signal.signal(s,lambda s,f:pending.append(s))
         tracker.enable_subreaper()
-        with (output/'probe.log').open('xb') as log:
+        with (output/log_name).open('xb') as log:
             child=subprocess.Popen(command,cwd=cwd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-            tracker.attach_launcher(child,phase='forcewm-two-adam')
-        tracker.register_launcher(child,phase='forcewm-two-adam');result['status']='running';save()
+            tracker.attach_launcher(child,phase=phase)
+        tracker.register_launcher(child,phase=phase);result['status']='running';save()
         while child.poll() is None:
             tracker.observe()
             if pending:raise RuntimeError('Probe interrupted')
-            if time.monotonic()>=end:raise TimeoutError('Probe time limit reached')
+            if time.monotonic()>=end or (deadline_unix is not None and time.time()>=deadline_unix-60):
+                raise TimeoutError('Execution time limit reached')
             try:child.wait(timeout=.2)
             except subprocess.TimeoutExpired:pass
         result['returncode']=child.returncode
-        closure=tracker.cleanup(end+60)
+        closure=tracker.cleanup(cleanup_deadline())
         if child.returncode!=0:raise RuntimeError('Native probe exited nonzero')
         if not closure['closure_verified'] or closure['signals'] or closure['errors']:
             raise RuntimeError('Successful probe requires unforced full descendant closure')
@@ -41,7 +48,7 @@ def execute(command,cwd,output,seconds):
         result.update(status='failed',error=str(error))
     finally:
         if tracker.enabled:
-            result['ownership']=tracker.cleanup(end+60)
+            result['ownership']=tracker.cleanup(cleanup_deadline())
             try:tracker.restore_subreaper();result['subreaper_restored']=True
             except Exception as e:result.update(status='failed',cleanup_error=str(e))
         if child is not None:result['returncode']=child.poll()

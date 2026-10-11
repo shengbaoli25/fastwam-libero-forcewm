@@ -129,10 +129,22 @@ sessions, cleans owned descendants on failure/deadline, and restores subreaper.
 The supervisor's rc0 only proves process exit; separately require the actual
 four-rank `two_adam_verified` receipt and unforced closure.
 
-Only after measured fit and an actual full-run time/storage budget, launch
-`scripts/train.py task=forcevla_libero_2cam_cached_forcewm_4gpu_30k` with the same
-resolved overrides and four-rank launcher. Do not shorten batch/steps, reduce
-Video generation steps, or change optimizer silently to pass the probe.
+After the actual four-rank preflight and an authorized full-run budget, use
+`scripts/forcewm/bounded_training.py --plan /path/to/formal-plan.json --execute`
+under system stdlib Python. The plan binds the exact resolved YAML, source,
+preflight receipts, native project `.venv/bin/python` four-rank argv, fresh
+output directories and allocation deadline. The guard requires the measured
+training estimate plus 5% margin, at least600s startup,5400s save allowance,
+3600s evaluation allowance and60s cleanup. These allowances are planning
+reserves, not measured checkpoint/evaluation timings. It checks current disk
+capacity for six snapshots with20% headroom.
+
+The formal entrypoint `train_resolved.py` records each rank and calls the
+inherited full30000-step trainer. The supervisor enforces the absolute
+allocation deadline, verifies all four complete origins plus nonempty final
+weights/model/optimizer/RNG files, and never claims a fresh distributed restore.
+Do not shorten batch/steps, reduce Video generation steps, or change optimizer
+silently. See [actual H100 validation](docs/forcewm_h100_validation.md).
 
 ## Validation boundaries
 

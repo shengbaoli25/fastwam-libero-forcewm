@@ -1,3 +1,13 @@
+# Dual-camera FastWAM with autoregressive Force WM
+
+This experimental fork adds a 30-layer causal, supervised force world model to
+LIBERO dual-camera FastWAM. Video/Action initialize from the complete official
+Base; Force does not use diffusion or Gaussian initialization. See
+[the experiment design and recipe](README_FORCEWM.md) and
+[the actual H100 preflight evidence](docs/forcewm_h100_validation.md).
+
+The original upstream documentation follows.
+
 # FastWAM
 
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
