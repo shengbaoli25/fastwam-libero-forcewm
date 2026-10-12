@@ -1,4 +1,4 @@
-"""Foreground single-node ForceWM restart with a fresh probe and fixed budget.
+"""Foreground eight-rank single-node ForceWM restart with a fresh probe and fixed budget.
 
 No launch on import. Platform task lifetime follows the foreground supervisor;
 there is no nohup, daemon, background Popen, or reset of the budget anchor.
@@ -33,7 +33,7 @@ def platform_identity(env):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{3,127}', job):
         raise ValueError('Platform TRAIN_JOB_ID required; no notebook fallback')
     if env.get('PET_NNODES', '1') != '1' or env.get('PET_NODE_RANK', '0') != '0':
-        raise ValueError('Only the authorized single-node four-rank job is supported')
+        raise ValueError('Only the authorized single-node eight-rank job is supported')
     return job
 
 
@@ -52,11 +52,8 @@ def hardware_check():
     gpu = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total,uuid',
                           '--format=csv,noheader'], capture_output=True, text=True, check=True).stdout
     physical_gpus = [line for line in gpu.strip().splitlines() if line]
-    # The pool may allocate a whole eight-GPU H200 node.  This job deliberately
-    # exposes only devices 0..3 to Accelerate, retaining the approved four
-    # ranks and global batch 64 while recording the complete allocation.
-    if len(physical_gpus) not in (4, 8) or not all('H200' in line for line in physical_gpus):
-        raise ValueError('Actual allocation must contain four or eight H200 GPUs')
+    if len(physical_gpus) != 8 or not all('H200' in line for line in physical_gpus):
+        raise ValueError('Actual allocation must contain exactly eight H200 GPUs')
     apps = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,process_name',
                            '--format=csv,noheader'], capture_output=True, text=True, check=True).stdout
     if apps.strip():
@@ -76,9 +73,15 @@ def prepare(source, job, folder):
         raise ValueError('Frozen GPU-validated recipe changed')
     provenance = json.loads((prior_folder / 'preparation.json').read_text())
     for name, digest in provenance['source_inventory']['files'].items():
-        if sha(source / 'src/fastwam/forcewm' / name) != digest:
+        if name != 'preflight.py' and sha(source / 'src/fastwam/forcewm' / name) != digest:
             raise ValueError('GPU-validated model math changed: ' + name)
-    output = SSD / f'fastwam-forcewm-{job}-4rank-30k-v5'
+    current_files = {p.name: sha(p) for p in sorted((source / 'src/fastwam/forcewm').glob('*.py'))}
+    if set(current_files) != set(provenance['source_inventory']['files']):
+        raise ValueError('ForceWM model/probe source file set changed unexpectedly')
+    provenance['previous_source_inventory'] = provenance['source_inventory']
+    provenance['source_inventory'] = {'files': current_files, 'sha256': hashlib.sha256(
+        json.dumps(current_files, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()}
+    output = SSD / f'fastwam-forcewm-{job}-8rank-30k-v6'
     if output.exists() or Path(str(output) + '_origins').exists():
         raise ValueError('Formal output cannot be reused')
     config = folder / 'resolved.yaml'
@@ -91,20 +94,21 @@ def prepare(source, job, folder):
     env['PYTHONPATH'] = str(source / 'src') + ':' + str(source)
     if env['CUDA_VISIBLE_DEVICES'] != '0,1,2,3':
         raise ValueError('Original four-rank visibility required')
+    env['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
     # The platform launches this single-node command. Accelerate creates its
-    # actual four ML ranks; platform outer-rank variables must not leak inside.
+    # actual eight ML ranks; platform outer-rank variables must not leak inside.
     for key in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE', 'LOCAL_WORLD_SIZE', 'GROUP_RANK',
                 'ROLE_RANK', 'ROLE_WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT',
                 'TORCHELASTIC_RUN_ID', 'TORCHELASTIC_RESTART_COUNT'):
         os.environ.pop(key, None)
     os.environ.update(env)
-    probe = SSD / f'fastwam-forcewm-{job}-two-adam-v5'
-    watch = SSD / f'fastwam-forcewm-{job}-probe-watch-v5'
+    probe = SSD / f'fastwam-forcewm-{job}-two-adam-v6'
+    watch = SSD / f'fastwam-forcewm-{job}-probe-watch-v6'
     argv = [str(NATIVE), '-m', 'accelerate.commands.launch', '--config_file',
-            str(source / 'scripts/accelerate_configs/accelerate_zero1_ds_4gpu.yaml'),
-            '--num_processes', '4', '--num_machines', '1', '--machine_rank', '0',
+            str(source / 'scripts/accelerate_configs/accelerate_zero1_ds_8gpu.yaml'),
+            '--num_processes', '8', '--num_machines', '1', '--machine_rank', '0',
             '-m', 'fastwam.forcewm.preflight', '--config', str(config),
-            '--output', str(probe), '--execute']
+            '--output', str(probe), '--expected-world-size', '8', '--execute']
     hardware = hardware_check()
     provenance.update(allocation_id=job, execution_mode='foreground_distributed_training',
                       observed_at=datetime.now(timezone.utc).isoformat(),
@@ -122,23 +126,23 @@ def prepare(source, job, folder):
     if result['status'] != 'process_exited_zero':
         raise RuntimeError('Fresh current-job probe failed; formal training was not launched')
     native = probe / 'preflight.json'
-    plan = dict(schema='forcewm-distributed50h-v5', allocation_id=job,
+    plan = dict(schema='forcewm-distributed8-50h-v6', allocation_id=job,
                 allocation_created_unix=json.loads((folder / 'dispatch.json').read_text())['started_unix'],
                 original_budget_anchor_unix=ANCHOR, deadline_unix=DEADLINE,
                 recovery_of_allocation_id='b2c145b8-a54c-46e0-8580-919ec0549792',
                 human_duration_approval=APPROVAL, execution_mode='foreground_distributed_training',
-                world_size=4, batch_per_rank=16, global_batch=64, max_steps=30000,
+                world_size=8, batch_per_rank=16, global_batch=128, max_steps=30000,
                 gradient_accumulation_steps=1, source=str(source), config=str(config),
                 native_python=str(NATIVE), training_output=str(output), origins=str(output) + '_origins',
-                supervision_output=str(SSD / f'fastwam-forcewm-{job}-formal-watch-v5'),
+                supervision_output=str(SSD / f'fastwam-forcewm-{job}-formal-watch-v6'),
                 preflight=str(native), probe_supervisor=str(watch / 'status.json'),
                 preparation=str(folder / 'preparation.json'), environment=env,
                 forcewm_source_inventory=provenance['source_inventory'], distributed_resume_verified=False)
     plan['estimated_required_seconds'] = estimate(json.loads(native.read_text()))
     plan['argv'] = argv[:argv.index('-m', 2)] + [str(source / 'scripts/forcewm/train_resolved.py'),
-                    '--config', str(config), '--origins', plan['origins']]
+                    '--config', str(config), '--origins', plan['origins'], '--expected-world-size', '8']
     files = [config, native, watch / 'status.json', folder / 'preparation.json',
-             folder / 'dispatch.json', source / 'scripts/accelerate_configs/accelerate_zero1_ds_4gpu.yaml',
+             folder / 'dispatch.json', source / 'scripts/accelerate_configs/accelerate_zero1_ds_8gpu.yaml',
              source / 'scripts/ds_configs/ds_zero1_config.json']
     files += [f for part in ('src', 'scripts/forcewm') for f in (source / part).rglob('*.py')]
     plan['input_sha256'] = {str(f): sha(f) for f in files}
@@ -147,21 +151,27 @@ def prepare(source, job, folder):
     return plan
 
 
+def require_probe_budget(now):
+    # Four-rank throughput is not an eight-rank timing measurement. Admit only
+    # a bounded fresh probe, then require its measured complete 30k budget.
+    if DEADLINE - now <= 1800 + 600 + 5400 + 3600 + 60:
+        raise ValueError('Insufficient time for fresh probe and fixed save/eval allowances')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
     args = parser.parse_args()
     if not args.execute:
         print(json.dumps({'mode': 'plan_only', 'deadline_unix': DEADLINE,
-                          'recipe': '4rank/B16/accum1/global64/30000/save5000'}))
+                          'recipe': '8rank/B16/accum1/global128/30000/save5000'}))
         return
     job = platform_identity(os.environ)
     source = Path(__file__).resolve().parents[2]
-    if time.time() >= DEADLINE - 34.06186647181942 * 3600:
-        raise ValueError('Prior measured full-run budget no longer fits; queue time did not reset deadline')
+    require_probe_budget(time.time())
     if not NATIVE.is_file() or not os.access(NATIVE, os.X_OK):
         raise ValueError('Original native .venv invocation is unavailable')
-    folder = BASE / f'distributed-{job}-v5'
+    folder = BASE / f'distributed-{job}-v6'
     folder.mkdir(exist_ok=False)
     write_new(folder / 'dispatch.json', {'job': job, 'started_unix': time.time(),
               'deadline_unix': DEADLINE, 'original_budget_anchor_unix': ANCHOR,

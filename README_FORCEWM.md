@@ -78,8 +78,8 @@ consequences, closed-loop control, or generalization.
 
 | Setting | Value |
 |---|---|
-| GPUs / processes | 4 H100 / 4 ranks |
-| Per-GPU batch / accumulation / global batch | 16 / 1 / 64 |
+| GPUs / processes | 8 H200 / 8 ranks (current authorized distributed job) |
+| Per-GPU batch / accumulation / global batch | 16 / 1 / 128 |
 | New training steps / checkpoint interval | 30000 / 5000 |
 | Video / Action / Force depth | 30 / 30 / 30 |
 | Force width / heads / FFN | 1280 / 16 / 4608 |
@@ -95,6 +95,16 @@ consequences, closed-loop control, or generalization.
 | Seeds | baseline42 / Force43 / independent Video-memory RNG44 |
 | Activation recomputation | Force blocks and new Action memory enabled |
 | Full training resume | null; starts from official Base |
+
+The current eight-rank deployment uses `scripts/forcewm/distributed_job.py --execute`
+as its foreground platform command. It first runs a fresh eight-rank two-Adam
+probe with `accelerate_zero1_ds_8gpu.yaml`, verifies every rank and unforced
+process-tree closure, and checks the measured complete 30000-step budget before
+starting formal training. A four-rank receipt cannot satisfy this gate. Historical
+H100/H200 four-rank runs used global64 and remain separate evidence. The per-rank
+batch, learning rate, warmup, save interval, model mathematics and cached data
+are unchanged. Eight ranks double samples per update, not necessarily steps per
+second; throughput and the budget must be measured on the new allocation.
 
 The width/heads/FFN follow the PDF; depth is the requested30. The actual
 parameter count is0.893B, not the PDF's approximate0.7B. The original DS JSON

@@ -9,10 +9,11 @@ import pytest
 ROOT=Path(__file__).resolve().parents[2]
 
 @pytest.mark.parametrize('mode',['success','failure','deadline'])
-def test_all_four_sessions_closed(tmp_path,mode):
+@pytest.mark.parametrize('sessions',[4,8])
+def test_all_sessions_closed(tmp_path,mode,sessions):
     worker='import time;time.sleep('+('0.4' if mode=='success' else '60')+')'
     code='import subprocess,sys,time,json,pathlib\n'
-    code+=f'workers=[subprocess.Popen([sys.executable,"-c",{worker!r}],start_new_session=True) for _ in range(4)]\n'
+    code+=f'workers=[subprocess.Popen([sys.executable,"-c",{worker!r}],start_new_session=True) for _ in range({sessions})]\n'
     code+=f'pathlib.Path({str(tmp_path/"pids.json")!r}).write_text(json.dumps([p.pid for p in workers]))\n'
     code+='time.sleep(.2)\n'
     code+=('for p in workers:assert p.wait()==0\n' if mode=='success' else 'raise SystemExit(7)\n' if mode=='failure' else 'time.sleep(60)\n')

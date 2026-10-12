@@ -1,4 +1,4 @@
-"""Launch one hash-bound four-rank training under its explicit allocation budget."""
+"""Launch hash-bound training under an explicitly authorized recipe and budget."""
 import argparse
 import hashlib
 import json
@@ -13,9 +13,19 @@ from bounded_probe import execute
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def recipe_world_size(plan):
+    schemas = ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4','forcewm-distributed50h-v5','forcewm-distributed8-50h-v6')
+    if plan['schema'] not in schemas:
+        raise ValueError('Unknown authorized recipe schema')
+    expected = 8 if plan['schema']=='forcewm-distributed8-50h-v6' else 4
+    if plan['world_size'] != expected:
+        raise ValueError('World size differs from explicitly authorized recipe')
+    return expected
+
+
 def validate_plan(plan,now):
-    if (plan['schema'] not in ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4','forcewm-distributed50h-v5') or plan['world_size']!=4
-            or plan['batch_per_rank']!=16 or plan['global_batch']!=64 or plan['max_steps']!=30000
+    world=recipe_world_size(plan)
+    if (plan['batch_per_rank']!=16 or plan['global_batch']!=16*world or plan['max_steps']!=30000
             or plan['gradient_accumulation_steps']!=1):
         raise ValueError('Exact authorized ForceWM training recipe required')
     if plan['schema']=='forcewm-h100-formal-v1':
@@ -24,7 +34,7 @@ def validate_plan(plan,now):
     else:
         # Each explicit Oct12 approval extends the ORIGINAL budget anchor.
         # Replacing an allocation or restarting training never resets it.
-        deadline=1791914545 if plan['schema'] in ('forcewm-restart50h-v4','forcewm-distributed50h-v5') else 1791907345
+        deadline=1791914545 if plan['schema'] in ('forcewm-restart50h-v4','forcewm-distributed50h-v5','forcewm-distributed8-50h-v6') else 1791907345
         if (plan.get('original_budget_anchor_unix')!=1791734545
                 or plan['deadline_unix']!=deadline
                 or plan.get('recovery_of_allocation_id')!='b2c145b8-a54c-46e0-8580-919ec0549792'
@@ -36,7 +46,7 @@ def validate_plan(plan,now):
                 or not plan.get('restart_from_failed_plan')
                 or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
             raise ValueError('The fixed50h approval applies only to this authorized restart')
-        if plan['schema']=='forcewm-distributed50h-v5':
+        if plan['schema'] in ('forcewm-distributed50h-v5','forcewm-distributed8-50h-v6'):
             if (not plan.get('allocation_id') or plan['allocation_id']!=os.environ.get('TRAIN_JOB_ID')
                     or plan.get('restart_from_failed_plan')
                     or plan.get('execution_mode')!='foreground_distributed_training'
@@ -45,27 +55,29 @@ def validate_plan(plan,now):
     remaining=plan['deadline_unix']-now
     source=Path(plan['source']); config=plan['config']
     expected_argv=[plan['native_python'],'-m','accelerate.commands.launch','--config_file',
-        str(source/'scripts/accelerate_configs/accelerate_zero1_ds_4gpu.yaml'),
-        '--num_processes','4','--num_machines','1','--machine_rank','0',
+        str(source/f'scripts/accelerate_configs/accelerate_zero1_ds_{world}gpu.yaml'),
+        '--num_processes',str(world),'--num_machines','1','--machine_rank','0',
         str(source/'scripts/forcewm/train_resolved.py'),'--config',config,'--origins',plan['origins']]
+    if world==8:
+        expected_argv += ['--expected-world-size','8']
     if plan['argv']!=expected_argv or not plan['native_python'].endswith('/realman-fastwam/.venv/bin/python'):
-        raise ValueError('Exact native four-rank invocation required')
+        raise ValueError('Exact native invocation for the authorized world size required')
     required={config,plan['preflight'],plan['probe_supervisor'],plan['preparation'],
-        str(source/'scripts/accelerate_configs/accelerate_zero1_ds_4gpu.yaml'),
+        str(source/f'scripts/accelerate_configs/accelerate_zero1_ds_{world}gpu.yaml'),
         str(source/'scripts/ds_configs/ds_zero1_config.json')}
     required.update(str(p) for folder in ('src','scripts/forcewm') for p in (source/folder).rglob('*.py'))
     if not required.issubset(plan['input_sha256']):
         raise ValueError('All executed source/config/receipts must be hash-bound')
     if (plan['environment']['PYTHONPATH']!=str(source/'src')+':'+str(source)
-            or plan['environment']['CUDA_VISIBLE_DEVICES']!='0,1,2,3'
+            or plan['environment']['CUDA_VISIBLE_DEVICES']!=','.join(map(str,range(world)))
             or plan['environment']['DIFFSYNTH_SKIP_DOWNLOAD']!='true'):
-        raise ValueError('Bound source and four visible GPUs required')
+        raise ValueError('Bound source and all authorized visible GPUs required')
     for path,digest in plan['input_sha256'].items():
         if sha(path)!=digest:raise ValueError('Bound input changed: '+path)
     native=json.loads(Path(plan['preflight']).read_text())
     outer=json.loads(Path(plan['probe_supervisor']).read_text())
     preparation=json.loads(Path(plan['preparation']).read_text())
-    if plan['schema']=='forcewm-distributed50h-v5':
+    if plan['schema'] in ('forcewm-distributed50h-v5','forcewm-distributed8-50h-v6'):
         if (preparation.get('allocation_id')!=plan['allocation_id']
                 or preparation.get('execution_mode')!=plan['execution_mode']
                 or preparation.get('current_node_probe') is not True
@@ -73,6 +85,12 @@ def validate_plan(plan,now):
                 or outer.get('command')!=preparation.get('probe_argv')
                 or outer.get('absolute_deadline_unix')!=plan['deadline_unix']):
             raise ValueError('Actual current-job probe and foreground provenance required')
+        if world==8:
+            expected_probe=expected_argv[:11]+['-m','fastwam.forcewm.preflight',
+                '--config',config,'--output',str(Path(plan['preflight']).parent),
+                '--expected-world-size','8','--execute']
+            if preparation['probe_argv']!=expected_probe:
+                raise ValueError('Exact native eight-rank probe invocation required')
     if plan.get('restart_from_failed_plan'):
         # Reuse the real same-allocation GPU probe only for identical model and
         # training code. A new output directory and repaired outer guard do not
@@ -109,11 +127,11 @@ def validate_plan(plan,now):
     for name,digest in preparation['source_inventory']['files'].items():
         if sha(source/'src/fastwam/forcewm'/name)!=digest:
             raise ValueError('GPU-validated model code changed')
-    if (native['status']!='two_adam_verified' or len(native['ranks'])!=4
-            or {r['rank'] for r in native['ranks']}!=set(range(4))):
-        raise ValueError('All four actual Adam receipts required')
+    if (native['status']!='two_adam_verified' or len(native['ranks'])!=world
+            or {r['rank'] for r in native['ranks']}!=set(range(world))):
+        raise ValueError('All authorized ranks need actual Adam receipts')
     for rank in native['ranks']:
-        if (rank['accepted'] is not True or rank['world_size']!=4 or rank['global_batch']!=64
+        if (rank['accepted'] is not True or rank['world_size']!=world or rank['global_batch']!=16*world
                 or rank['batch_per_rank']!=16 or rank['actual_engine_updates']!=2
                 or not rank['adam_state_steps'] or not all(x==2 for x in rank['adam_state_steps'])
                 or rank['all_parameters_finite'] is not True or rank['adam_master_and_moments_finite'] is not True
@@ -140,14 +158,17 @@ def validate_plan(plan,now):
 
 
 def verify_completion(plan):
+    world=recipe_world_size(plan)
     output=Path(plan['training_output'])
-    for rank in range(4):
+    for rank in range(world):
         r=json.loads((Path(plan['origins'])/f'rank_{rank:03d}.json').read_text())
-        if (r['status']!='complete' or r['rank']!=rank or r['world_size']!=4 or r['max_steps']!=30000
+        if (r['status']!='complete' or r['rank']!=rank or r['world_size']!=world or r['max_steps']!=30000
                 or r['config_sha256']!=plan['input_sha256'][plan['config']]
                 or r['forcewm_source_inventory']!=plan['forcewm_source_inventory']
                 or r['output']!=plan['training_output']):
-            raise ValueError('All four complete origins required')
+            raise ValueError('All authorized rank origins must be complete')
+        if world==8 and (r.get('batch_per_rank')!=16 or r.get('global_batch')!=128):
+            raise ValueError('All eight origins must record B16/global128')
     state=output/'checkpoints/state/step_030000'
     if json.loads((state/'trainer_state.json').read_text())['global_step']!=30000:
         raise ValueError('Final trainer state missing')
@@ -156,11 +177,11 @@ def verify_completion(plan):
         raise ValueError('Final weights missing/empty')
     files=[f for f in state.rglob('*') if f.is_file()]
     names={f.name for f in files}
-    expected={f'bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt' for rank in range(4)}
-    expected.update(f'random_states_{rank}.pkl' for rank in range(4))
+    expected={f'bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt' for rank in range(world)}
+    expected.update(f'random_states_{rank}.pkl' for rank in range(world))
     if (any(f.stat().st_size==0 for f in files) or not expected.issubset(names)
             or not any('model_states' in name for name in names)):
-        raise ValueError('Complete nonempty model, optimizer and four RNG states required')
+        raise ValueError('Complete nonempty model, optimizer and all rank RNG states required')
     return {'status':'completed_30000','weights_bytes':weight.stat().st_size,
             'state_bytes':sum(f.stat().st_size for f in files),'distributed_resume_verified':False}
 

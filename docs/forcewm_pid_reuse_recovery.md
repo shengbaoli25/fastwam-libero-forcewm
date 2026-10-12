@@ -17,3 +17,29 @@ For platform distributed training, `scripts/forcewm/distributed_job.py --execute
 The distributed task's maximum-runtime form field is optional and supports days. Leaving it blank does not establish a guarantee of unlimited platform lifetime: the space also applies low-utilization automatic recycling. The supervisor retains the human-approved absolute deadline regardless of the form field. CPU tests cover current-job receipt rejection and mocked preparation/argv construction; actual GPU throughput and full checkpoint saving still require runtime evidence.
 
 The H200 training pools currently offer a whole-node eight-GPU resource specification. The hardware guard accepts either four or eight allocated H200 GPUs, but the unchanged environment exposes only `CUDA_VISIBLE_DEVICES=0,1,2,3` and the launcher creates exactly four ranks (global batch 64). The complete physical allocation is recorded. The other four GPUs are not used by this experiment, and eight-GPU allocation billing must not be described as four-GPU billing. Three added CPU cases cover both supported allocation sizes and an invalid allocation; 60 targeted dispatch/budget tests pass. This does not establish an eight-rank training result.
+
+## Current eight-rank request (2026-10-12)
+
+The user explicitly changed the requested training recipe to eight H200 ranks,
+batch16 per rank, accumulation1 and global128. The superseded four-rank
+queued task was stopped before it obtained resources. `forcewm-distributed8-50h-v6`
+now requires exactly eight physical H200 GPUs and exposes all devices0..7.
+The native probe and trainer take `--expected-world-size 8`; actual engine
+batch128, eight Adam receipts, complete rank0..7 origins, eight optimizer shards
+and eight RNG states are required. Historical four-rank schemas still reject
+an eight-rank plan, and old receipts cannot pass the new job's validation.
+
+All model mathematics, cached features, official Base initialization, learning
+rate1e-4, warmup1500, 30000 steps and save5000 remain unchanged. The only changed
+ForceWM library file relative to the real four-rank probe is the preflight
+runner; the current full inventory is freshly bound to the new probe. 73 targeted
+CPU dispatch/budget/receipt tests and three real eight-session process tests
+(success, failure, deadline) pass. These are not GPU throughput or save/load tests.
+
+The fixed approved deadline remains 2026-10-14 02:02:25 Asia/Shanghai. The old
+four-rank throughput estimate is not used as an eight-rank speed measurement or
+halved to invent a new estimate. A bounded current-node eight-rank probe may run
+while its probe/save/eval allowances fit; the complete measured 30000-step budget
+must fit before formal dispatch. The platform foreground process then proceeds
+automatically without a scheduled local polling task. Platform runtime remains
+unset and automatic retries stay disabled.

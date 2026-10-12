@@ -95,15 +95,16 @@ def test_reject_drift(plan,change):
     with pytest.raises(ValueError):guard.validate_plan(plan,1100)
 
 def complete_fixture(plan):
+    world = plan['world_size']
     origins=Path(plan['origins']);origins.mkdir()
-    for r in range(4):
+    for r in range(world):
         (origins/f'rank_{r:03d}.json').write_text(json.dumps({'rank':r,'status':'complete',
-          'world_size':4,'max_steps':30000,'config_sha256':plan['input_sha256'][plan['config']],
+          'world_size':world,'batch_per_rank':16,'global_batch':16*world,'max_steps':30000,'config_sha256':plan['input_sha256'][plan['config']],
           'forcewm_source_inventory':plan['forcewm_source_inventory'],'output':plan['training_output']}))
     output=Path(plan['training_output']);state=output/'checkpoints/state/step_030000';state.mkdir(parents=True)
     (state/'trainer_state.json').write_text(json.dumps({'global_step':30000}))
     (state/'mp_rank_00_model_states.pt').write_text('TEST-only')
-    for r in range(4):
+    for r in range(world):
         (state/f'bf16_zero_pp_rank_{r}_mp_rank_00_optim_states.pt').write_text('TEST-only')
         (state/f'random_states_{r}.pkl').write_text('TEST-only')
     weight=output/'checkpoints/weights/step_030000.pt';weight.parent.mkdir();weight.write_text('TEST-only')
@@ -238,3 +239,67 @@ def test_distributed_rejects_other_job_receipts_and_queue_budget_drift(plan, mon
         elif drift == 'deadline': value['absolute_deadline_unix'] += 1
         path.write_text(json.dumps(value)); p['input_sha256'][str(path)] = guard.sha(path)
     with pytest.raises(ValueError): guard.validate_plan(p, now)
+
+
+def distributed8_fixture(plan, monkeypatch):
+    p = distributed_fixture(plan, monkeypatch)
+    p.update(schema='forcewm-distributed8-50h-v6', world_size=8, global_batch=128)
+    source = Path(p['source'])
+    accel = source / 'scripts/accelerate_configs/accelerate_zero1_ds_8gpu.yaml'
+    accel.write_text('TEST-only-eight-ranks')
+    p['input_sha256'][str(accel)] = guard.sha(accel)
+    p['argv'][4] = str(accel); p['argv'][6] = '8'
+    p['argv'] += ['--expected-world-size', '8']
+    p['environment']['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+    native = Path(p['preflight']); value = json.loads(native.read_text())
+    rows = value['ranks']
+    value['ranks'] = [dict(copy.deepcopy(rows[r % 4]), rank=r, world_size=8, global_batch=128) for r in range(8)]
+    native.write_text(json.dumps(value)); p['input_sha256'][str(native)] = guard.sha(native)
+    probe_argv = p['argv'][:11] + ['-m', 'fastwam.forcewm.preflight', '--config', p['config'],
+        '--output', str(native.parent), '--expected-world-size', '8', '--execute']
+    prep = Path(p['preparation']); value = json.loads(prep.read_text()); value['probe_argv'] = probe_argv
+    prep.write_text(json.dumps(value)); p['input_sha256'][str(prep)] = guard.sha(prep)
+    outer = Path(p['probe_supervisor']); value = json.loads(outer.read_text()); value['command'] = probe_argv
+    outer.write_text(json.dumps(value)); p['input_sha256'][str(outer)] = guard.sha(outer)
+    return p
+
+
+def test_eight_rank_plan_requires_current_eight_rank_evidence(plan, monkeypatch):
+    p = distributed8_fixture(plan, monkeypatch)
+    assert guard.validate_plan(p, 1791778000) == 136485
+    state = complete_fixture(p)
+    assert guard.verify_completion(p)['status'] == 'completed_30000'
+    assert guard.verify_completion(p)['distributed_resume_verified'] is False
+    (state / 'bf16_zero_pp_rank_7_mp_rank_00_optim_states.pt').unlink()
+    with pytest.raises(ValueError): guard.verify_completion(p)
+
+
+@pytest.mark.parametrize('drift', ['four_receipts', 'duplicate_rank', 'rank_world', 'rank_global',
+    'four_visible', 'four_formal_argv', 'four_probe_argv', 'unverified_schema', 'budget'])
+def test_eight_rank_plan_rejects_partial_or_old_evidence(plan, monkeypatch, drift):
+    p = distributed8_fixture(plan, monkeypatch); now = 1791778000
+    if drift in ('four_receipts', 'duplicate_rank', 'rank_world', 'rank_global'):
+        file = Path(p['preflight']); value = json.loads(file.read_text())
+        if drift == 'four_receipts': value['ranks'] = value['ranks'][:4]
+        elif drift == 'duplicate_rank': value['ranks'][7]['rank'] = 6
+        elif drift == 'rank_world': value['ranks'][7]['world_size'] = 4
+        else: value['ranks'][7]['global_batch'] = 64
+        file.write_text(json.dumps(value)); p['input_sha256'][str(file)] = guard.sha(file)
+    elif drift == 'four_visible': p['environment']['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    elif drift == 'four_formal_argv': p['argv'][6] = '4'
+    elif drift == 'four_probe_argv':
+        for key in ('preparation', 'probe_supervisor'):
+            file = Path(p[key]); value = json.loads(file.read_text())
+            value['probe_argv' if key == 'preparation' else 'command'][6] = '4'
+            file.write_text(json.dumps(value)); p['input_sha256'][str(file)] = guard.sha(file)
+    elif drift == 'unverified_schema': p['schema'] = 'forcewm-distributed50h-v5'
+    else: now = p['deadline_unix'] - 1000
+    with pytest.raises(ValueError): guard.validate_plan(p, now)
+
+
+@pytest.mark.parametrize('missing', ['origin7', 'rng7'])
+def test_eight_rank_completion_rejects_missing_upper_rank(plan, monkeypatch, missing):
+    p = distributed8_fixture(plan, monkeypatch); state = complete_fixture(p)
+    file = Path(p['origins']) / 'rank_007.json' if missing == 'origin7' else state / 'random_states_7.pkl'
+    file.unlink()
+    with pytest.raises((FileNotFoundError, ValueError)): guard.verify_completion(p)

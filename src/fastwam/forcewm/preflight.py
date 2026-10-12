@@ -1,4 +1,4 @@
-"""Actual four-rank B16 two-Adam probe; never substitutes tiny-model tests."""
+"""Actual explicitly selected four/eight-rank B16 two-Adam probe."""
 import argparse
 import importlib.util
 import json
@@ -45,7 +45,13 @@ def build_probe_datasets(data_cfg):
     return train_ds, val_ds
 
 
-def execute(config_path,output):
+def validate_world_size(actual, expected):
+    if expected not in (4, 8) or actual != expected:
+        raise RuntimeError('Actual DeepSpeed world size must match the explicit four/eight-rank recipe')
+    return expected * 16
+
+
+def execute(config_path,output,expected_world_size=4):
     import torch
     from accelerate import Accelerator
     from hydra.utils import instantiate
@@ -61,8 +67,9 @@ def execute(config_path,output):
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK','0')))
     torch.cuda.reset_peak_memory_stats()
     accelerator=Accelerator(gradient_accumulation_steps=1,mixed_precision='bf16',step_scheduler_with_optimizer=False)
-    if accelerator.num_processes!=4 or accelerator.state.deepspeed_plugin is None:
-        raise RuntimeError('Actual four DeepSpeed ranks required')
+    global_batch=validate_world_size(accelerator.num_processes,expected_world_size)
+    if accelerator.state.deepspeed_plugin is None:
+        raise RuntimeError('Actual DeepSpeed ranks required')
     output=Path(output)
     if accelerator.is_main_process:output.mkdir(parents=True,exist_ok=False)
     accelerator.wait_for_everyone()
@@ -83,9 +90,9 @@ def execute(config_path,output):
     engine=trainer.model
     zero=trainer.accelerator.state.deepspeed_plugin.deepspeed_config['zero_optimization']
     if (zero['stage']!=1 or engine.train_micro_batch_size_per_gpu()!=16
-            or engine.gradient_accumulation_steps()!=1 or engine.train_batch_size()!=64
+            or engine.gradient_accumulation_steps()!=1 or engine.train_batch_size()!=global_batch
             or any(zero.get(k,{}).get('device','none')!='none' for k in ('offload_optimizer','offload_param'))):
-        raise RuntimeError('Actual engine differs from four-rank global64 original ZeRO1')
+        raise RuntimeError('Actual engine differs from the explicit B16/global-batch original ZeRO1 recipe')
     h=helpers();adam=h.unwrap_optimizer(trainer.optimizer)
     if not isinstance(adam,torch.optim.AdamW):raise RuntimeError('Actual AdamW required')
     if h.inspect_scheduler(trainer.scheduler)!={'last_epoch':0,'warmup_milestones':[1500],'cosine_steps':28500}:
@@ -97,7 +104,7 @@ def execute(config_path,output):
     torch.cuda.synchronize();startup=time.monotonic()-start
     losses,updates=h.run_two_updates(trainer,synchronize=torch.cuda.synchronize)
     for handle in handles:handle.remove()
-    report={'rank':rank,'world_size':4,'batch_per_rank':16,'global_batch':64,
+    report={'rank':rank,'world_size':expected_world_size,'batch_per_rank':16,'global_batch':global_batch,
         'actual_engine_updates':int(engine.global_steps),'scheduler':h.inspect_scheduler(trainer.scheduler),
         **h.inspect_adam(adam),'losses':losses,'updates':updates,'teacher_layer_calls':layer_calls,
         'all_parameters_finite':all(h._finite(p) for p in model.mot.parameters()),
@@ -113,7 +120,7 @@ def execute(config_path,output):
         and all(not u['optimizer_step_was_skipped'] for u in updates))
     report['accepted']=bool(accepted)
     (rank_dir/'preflight.json').write_text(json.dumps(report,indent=2,allow_nan=False))
-    ranks=[None]*4;torch.distributed.all_gather_object(ranks,report)
+    ranks=[None]*expected_world_size;torch.distributed.all_gather_object(ranks,report)
     if accelerator.is_main_process:
         accepted=all(r['accepted'] for r in ranks) and all(r['memory_rng_state']==ranks[0]['memory_rng_state'] for r in ranks)
         warm=max(r['updates'][-1]['seconds'] for r in ranks)
@@ -132,10 +139,11 @@ def execute(config_path,output):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',required=True);parser.add_argument('--output',required=True)
+    parser.add_argument('--expected-world-size',type=int,choices=(4,8),default=4)
     parser.add_argument('--execute',action='store_true');args=parser.parse_args()
     if not args.execute:
-        print(json.dumps({'mode':'plan_only','world_size':4,'B':16,'global_batch':64,'schedule':30000,'probe_updates':2}));return
-    try:ok=execute(args.config,args.output)
+        print(json.dumps({'mode':'plan_only','world_size':args.expected_world_size,'B':16,'global_batch':16*args.expected_world_size,'schedule':30000,'probe_updates':2}));return
+    try:ok=execute(args.config,args.output,args.expected_world_size)
     except Exception as e:
         import sys
         result={'status':'failed','error_type':type(e).__name__,'error':str(e),'rank':int(os.environ.get('RANK',0))}
