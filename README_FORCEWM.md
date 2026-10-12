@@ -106,10 +106,53 @@ batch, learning rate, warmup, save interval, model mathematics and cached data
 are unchanged. Eight ranks double samples per update, not necessarily steps per
 second; throughput and the budget must be measured on the new allocation.
 
+For the current authorized eight-rank job, schema
+`forcewm-distributed8-launch50h-v7` starts its50h allowance at the actual
+formal Accelerate launcher invocation. Queue time and the separately bounded
+1800s fresh probe are excluded. After the measured full30000-step budget fits,
+the supervisor writes an exclusive `formal-launch.json` containing the current
+platform job, launcher PID/start_ticks, launch timestamp and launch+180000s
+deadline. It reserves the last60s for cleanup, retains full descendant tracking
+and refuses to reuse an existing run directory. Historical40h/48h/fixed50h
+plans retain their original deadlines. Platform maximum runtime remains a
+separate setting and does not establish unlimited resource availability.
+
 The width/heads/FFN follow the PDF; depth is the requested30. The actual
 parameter count is0.893B, not the PDF's approximate0.7B. The original DS JSON
 has no `gradient_clipping` key; trainer `max_grad_norm=1` does not establish
 engine clipping at1. Source/config defaults are not proof of H100 fit.
+
+## User-selected interactive allocations
+
+The new interactive entrypoint is separate from the distributed job entrypoint.
+Latest user instruction chooses whichever is immediately available; the running
+four-H200 allocation `ab5d6993-795b-4bf7-9084-e59f089e7788` uses four ranks,
+B16/accumulation1/global64/30000, while the queued h100-8 UUID below uses eight
+ranks/global128 only if explicitly selected. Pass the actual selected allocation
+UUID to the same command; the entrypoint pins its matching GPU model and world
+size, never launches both, and refuses other UUIDs.
+
+
+```bash
+/usr/bin/python3 scripts/forcewm/interactive_job.py \
+  --allocation-id 35a848a2-4523-47f0-a0f1-cf2e7ebd8a2b --execute
+```
+
+Run only inside the platform-verified `h100-8` container. The UUID is an
+explicit operator binding, not a synthetic `TRAIN_JOB_ID`. The entrypoint
+rejects distributed-job environments and a conflicting `NOTEBOOK_ID`, records
+actual hostname/boot ID, requires the selected four idle H200 or eight idle H100 GPUs, and performs a
+fresh matching-world-size/two-Adam probe before any formal training. It keeps B16,
+accumulation1, global128 and30000 steps, with official Base initialization and
+completed VAE features. Fresh probe/model receipts from other allocations do
+not qualify. No model or optimizer math changes are involved in this adapter.
+
+The latest50h clock starts once when the formal launcher is actually created;
+queue time and the independently bounded probe do not consume it. The exclusive
+`formal-launch.json` records the notebook UUID separately from distributed jobs,
+actual PID/start_ticks, launch time and launch+50h deadline. Existing outputs
+cannot be reused to reset the clock. Platform runtime/reclamation policies are
+independent; an automatic-stop setting of OFF does not promise an unlimited run.
 
 ## Running
 

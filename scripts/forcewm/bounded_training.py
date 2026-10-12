@@ -9,26 +9,50 @@ import shutil
 import time
 from bounded_probe import execute
 
+LAUNCH_SCHEMA='forcewm-distributed8-launch50h-v7'
+INTERACTIVE_SCHEMA='forcewm-interactive8-h100-launch50h-v8'
+INTERACTIVE_ALLOCATION='35a848a2-4523-47f0-a0f1-cf2e7ebd8a2b'
+INTERACTIVE4_SCHEMA='forcewm-interactive4-h200-launch50h-v9'
+INTERACTIVE4_ALLOCATION='ab5d6993-795b-4bf7-9084-e59f089e7788'
+INTERACTIVE_RECIPES={INTERACTIVE_ALLOCATION:(INTERACTIVE_SCHEMA,8,'H100','v8'),
+                     INTERACTIVE4_ALLOCATION:(INTERACTIVE4_SCHEMA,4,'H200','v9')}
+LAUNCH_APPROVAL='截止时间仍为10月14日02:02:25，按照实际开始启动训练的时间来算'
+LAUNCH_DURATION_SECONDS=50*3600
+
 
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def recipe_world_size(plan):
-    schemas = ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4','forcewm-distributed50h-v5','forcewm-distributed8-50h-v6')
+    schemas = ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4','forcewm-distributed50h-v5','forcewm-distributed8-50h-v6',LAUNCH_SCHEMA,INTERACTIVE_SCHEMA,INTERACTIVE4_SCHEMA)
     if plan['schema'] not in schemas:
         raise ValueError('Unknown authorized recipe schema')
-    expected = 8 if plan['schema']=='forcewm-distributed8-50h-v6' else 4
+    expected = 8 if plan['schema'] in ('forcewm-distributed8-50h-v6',LAUNCH_SCHEMA,INTERACTIVE_SCHEMA) else 4
     if plan['world_size'] != expected:
         raise ValueError('World size differs from explicitly authorized recipe')
     return expected
 
 
 def validate_plan(plan,now):
+    if type(now) not in (int,float) or not math.isfinite(now):
+        raise ValueError('Actual finite current time required')
     world=recipe_world_size(plan)
     if (plan['batch_per_rank']!=16 or plan['global_batch']!=16*world or plan['max_steps']!=30000
             or plan['gradient_accumulation_steps']!=1):
         raise ValueError('Exact authorized ForceWM training recipe required')
-    if plan['schema']=='forcewm-h100-formal-v1':
+    launch_relative=plan['schema'] in (LAUNCH_SCHEMA,INTERACTIVE_SCHEMA,INTERACTIVE4_SCHEMA)
+    if launch_relative:
+        if (plan.get('budget_anchor')!='formal_launcher_start'
+                or type(plan.get('duration_seconds')) is not int
+                or plan['duration_seconds']!=LAUNCH_DURATION_SECONDS
+                or plan.get('deadline_unix') is not None
+                or plan.get('formal_launcher_started_unix') is not None
+                or plan.get('original_budget_anchor_unix') is not None
+                or plan.get('human_duration_approval')!=LAUNCH_APPROVAL
+                or type(plan.get('allocation_created_unix')) not in (int,float)
+                or not 0<plan['allocation_created_unix']<=now):
+            raise ValueError('Authorized50h must start once at actual formal launcher creation')
+    elif plan['schema']=='forcewm-h100-formal-v1':
         if plan['deadline_unix']-plan['allocation_created_unix']!=40*3600:
             raise ValueError('Deadline must remain allocation creation plus40h')
     else:
@@ -46,13 +70,24 @@ def validate_plan(plan,now):
                 or not plan.get('restart_from_failed_plan')
                 or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
             raise ValueError('The fixed50h approval applies only to this authorized restart')
-        if plan['schema'] in ('forcewm-distributed50h-v5','forcewm-distributed8-50h-v6'):
-            if (not plan.get('allocation_id') or plan['allocation_id']!=os.environ.get('TRAIN_JOB_ID')
-                    or plan.get('restart_from_failed_plan')
-                    or plan.get('execution_mode')!='foreground_distributed_training'
-                    or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
-                raise ValueError('Distributed restart requires its current TRAIN_JOB_ID and fresh GPU probe')
-    remaining=plan['deadline_unix']-now
+    distributed=plan['schema'] in ('forcewm-distributed50h-v5','forcewm-distributed8-50h-v6',LAUNCH_SCHEMA)
+    interactive=plan['schema'] in (INTERACTIVE_SCHEMA,INTERACTIVE4_SCHEMA)
+    if interactive:
+        expected_allocation=INTERACTIVE_ALLOCATION if world==8 else INTERACTIVE4_ALLOCATION
+        if (plan.get('allocation_id')!=expected_allocation
+                or os.environ.get('FORCEWM_INTERACTIVE_ALLOCATION_ID')!=expected_allocation
+                or os.environ.get('TRAIN_JOB_ID')
+                or plan.get('execution_mode')!='foreground_interactive_modeling'
+                or plan.get('restart_from_failed_plan')):
+            raise ValueError('Current h100-8 explicit allocation binding and fresh probe required')
+    if distributed:
+        approval=LAUNCH_APPROVAL if launch_relative else '同意延长到50小时并重启'
+        if (not plan.get('allocation_id') or plan['allocation_id']!=os.environ.get('TRAIN_JOB_ID')
+                or plan.get('restart_from_failed_plan')
+                or plan.get('execution_mode')!='foreground_distributed_training'
+                or plan.get('human_duration_approval')!=approval):
+            raise ValueError('Distributed restart requires its current TRAIN_JOB_ID and fresh GPU probe')
+    remaining=LAUNCH_DURATION_SECONDS if launch_relative else plan['deadline_unix']-now
     source=Path(plan['source']); config=plan['config']
     expected_argv=[plan['native_python'],'-m','accelerate.commands.launch','--config_file',
         str(source/f'scripts/accelerate_configs/accelerate_zero1_ds_{world}gpu.yaml'),
@@ -77,20 +112,31 @@ def validate_plan(plan,now):
     native=json.loads(Path(plan['preflight']).read_text())
     outer=json.loads(Path(plan['probe_supervisor']).read_text())
     preparation=json.loads(Path(plan['preparation']).read_text())
-    if plan['schema'] in ('forcewm-distributed50h-v5','forcewm-distributed8-50h-v6'):
+    if distributed or interactive:
         if (preparation.get('allocation_id')!=plan['allocation_id']
                 or preparation.get('execution_mode')!=plan['execution_mode']
                 or preparation.get('current_node_probe') is not True
                 or preparation.get('probe_output')!=str(Path(plan['preflight']).parent)
                 or outer.get('command')!=preparation.get('probe_argv')
-                or outer.get('absolute_deadline_unix')!=plan['deadline_unix']):
+                or outer.get('absolute_deadline_unix')!=(plan.get('probe_deadline_unix') if launch_relative else plan['deadline_unix'])):
             raise ValueError('Actual current-job probe and foreground provenance required')
-        if world==8:
+        if launch_relative and (
+                preparation.get('probe_deadline_unix')!=plan['probe_deadline_unix']
+                or type(preparation.get('probe_started_unix')) not in (int,float)
+                or not plan['allocation_created_unix']<=preparation['probe_started_unix']<=now
+                or plan['probe_deadline_unix']-preparation['probe_started_unix']!=1860
+                or not 0<outer.get('limit_seconds',0)<=1800):
+            raise ValueError('Independent bounded fresh probe required before formal50h')
+        if world==8 or interactive:
             expected_probe=expected_argv[:11]+['-m','fastwam.forcewm.preflight',
                 '--config',config,'--output',str(Path(plan['preflight']).parent),
-                '--expected-world-size','8','--execute']
+                '--expected-world-size',str(world),'--execute']
             if preparation['probe_argv']!=expected_probe:
                 raise ValueError('Exact native eight-rank probe invocation required')
+    if interactive:
+        hardware=preparation.get('hardware','').strip().splitlines()
+        if len(hardware)!=world or not all(('H100' if world==8 else 'H200') in row for row in hardware):
+            raise ValueError('Current authorized H100/H200 hardware evidence required')
     if plan.get('restart_from_failed_plan'):
         # Reuse the real same-allocation GPU probe only for identical model and
         # training code. A new output directory and repaired outer guard do not
@@ -146,7 +192,9 @@ def validate_plan(plan,now):
         raise ValueError('Probe full-tree unforced closure required')
     warm=max(r['updates'][-1]['seconds'] for r in native['ranks'])
     minimum=warm*30000*1.05+max(600,max(r['startup_seconds'] for r in native['ranks']))+5400+3600+60
-    if not math.isfinite(minimum) or warm<=0 or remaining<max(minimum,plan['estimated_required_seconds']):
+    estimate=plan['estimated_required_seconds']
+    if (type(estimate) not in (int,float) or not math.isfinite(estimate) or estimate<=0
+            or not math.isfinite(minimum) or warm<=0 or remaining<max(minimum,estimate)):
         raise ValueError('Measured training plus 5% margin, startup, save/eval and cleanup do not fit')
     required_bytes=6*(sum(r['local_adam_master_and_moments_bytes'] for r in native['ranks'])
         +4*native['ranks'][0]['architecture_counts']['optimizer_parameters'])*1.2+10*2**30
@@ -194,9 +242,14 @@ def main():
     if not args.execute:
         print(json.dumps({'status':'plan_verified','seconds_available':remaining}));return
     os.environ.update(plan['environment'])
+    launch_relative=plan['schema'] in (LAUNCH_SCHEMA,INTERACTIVE_SCHEMA,INTERACTIVE4_SCHEMA)
     result=execute(plan['argv'],plan['source'],plan['supervision_output'],remaining,
-                   maximum_seconds=144000 if plan['schema']=='forcewm-h100-formal-v1' else 172800,
-                   deadline_unix=plan['deadline_unix'],
+                   maximum_seconds=LAUNCH_DURATION_SECONDS if launch_relative else
+                     (144000 if plan['schema']=='forcewm-h100-formal-v1' else 172800),
+                   deadline_unix=None if launch_relative else plan['deadline_unix'],
+                   duration_from_launch_seconds=LAUNCH_DURATION_SECONDS if launch_relative else None,
+                   execution_identity={'kind':'interactive_modeling','allocation_id':plan['allocation_id']}
+                     if plan['schema'] in (INTERACTIVE_SCHEMA,INTERACTIVE4_SCHEMA) else None,
                    log_name='training.log',phase='forcewm-formal30000')
     final={'status':'failed','supervisor_status':result['status'],'formal_training_started':True,
            'distributed_resume_verified':False}

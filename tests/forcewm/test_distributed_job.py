@@ -23,9 +23,9 @@ def test_current_job_identity():
     assert job.platform_identity({'TRAIN_JOB_ID': 'train-valid'}) == 'train-valid'
 
 
-@pytest.mark.parametrize('count', [8])
-def test_hardware_check_accepts_an_h200_node_for_eight_rank_execution(monkeypatch, count):
-    gpu = '\n'.join(f'{index}, NVIDIA H200, 143771 MiB, GPU-{index}' for index in range(count))
+@pytest.mark.parametrize('model', ['H100', 'H200'])
+def test_hardware_check_accepts_exact_requested_eight_gpu_model(monkeypatch, model):
+    gpu = '\n'.join(f'{index}, NVIDIA {model}, 81559 MiB, GPU-{index}' for index in range(8))
     responses = iter([gpu, ''])
 
     class Result:
@@ -36,7 +36,7 @@ def test_hardware_check_accepts_an_h200_node_for_eight_rank_execution(monkeypatc
     monkeypatch.setattr(job.os, 'pidfd_open', lambda *args: 77)
     monkeypatch.setattr(job.signal, 'pidfd_send_signal', lambda *args: None)
     monkeypatch.setattr(job.os, 'close', lambda *args: None)
-    assert job.hardware_check() == gpu
+    assert job.hardware_check(model) == gpu
 
 
 def test_hardware_check_rejects_an_incomplete_or_wrong_gpu_allocation(monkeypatch):
@@ -44,14 +44,19 @@ def test_hardware_check_rejects_an_incomplete_or_wrong_gpu_allocation(monkeypatc
         stdout = '0, NVIDIA H100, 81559 MiB, GPU-0\n1, NVIDIA H100, 81559 MiB, GPU-1'
 
     monkeypatch.setattr(job.subprocess, 'run', lambda *args, **kwargs: Result())
-    with pytest.raises(ValueError, match='exactly eight H200'):
+    with pytest.raises(ValueError, match='exactly 8 H200'):
         job.hardware_check()
 
 
-def test_prepare_uses_current_probe_and_exact_native_formal_argv(tmp_path, monkeypatch):
+@pytest.mark.parametrize('now',[1791778000,1791914545+86400])
+@pytest.mark.parametrize('interactive',[False,True,'four'])
+def test_prepare_uses_current_probe_and_exact_native_formal_argv(tmp_path, monkeypatch, now, interactive):
+    allocation=guard.INTERACTIVE4_ALLOCATION if interactive=='four' else guard.INTERACTIVE_ALLOCATION if interactive else 'train-current-fixture'
+    world=4 if interactive=='four' else 8
+    version='v9' if world==4 else 'v8' if interactive else 'v7'
     source = tmp_path / 'source'
     for name in ('src/fastwam/forcewm/model.py', 'scripts/forcewm/train_resolved.py',
-                 'scripts/accelerate_configs/accelerate_zero1_ds_8gpu.yaml',
+                 f'scripts/accelerate_configs/accelerate_zero1_ds_{world}gpu.yaml',
                  'scripts/ds_configs/ds_zero1_config.json'):
         p = source / name; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('TEST-only')
     base = tmp_path / 'base'; old = base / 'recovery-ab5d6993-v2'; old.mkdir(parents=True)
@@ -64,56 +69,57 @@ def test_prepare_uses_current_probe_and_exact_native_formal_argv(tmp_path, monke
         'DIFFSYNTH_SKIP_DOWNLOAD': 'true'}))
     monkeypatch.setattr(job, 'BASE', base); monkeypatch.setattr(job, 'SSD', ssd)
     monkeypatch.setattr(job, 'PRIOR_CONFIG_SHA', guard.sha(config))
-    monkeypatch.setattr(job, 'hardware_check', lambda: 'TEST-only-eight-GPUs')
-    monkeypatch.setattr(job.time, 'time', lambda: 1791778000)
+    monkeypatch.setattr(job, 'hardware_check', lambda *a: '\n'.join(f'{r}, {"H200" if world==4 else "H100"}, TEST-only' for r in range(world)))
+    monkeypatch.setattr(job.time, 'time', lambda: now)
     monkeypatch.setenv('TRAIN_JOB_ID', 'train-current-fixture')
+    if interactive:
+        monkeypatch.delenv('TRAIN_JOB_ID')
+        monkeypatch.setenv('FORCEWM_INTERACTIVE_ALLOCATION_ID',allocation)
     monkeypatch.setenv('RANK', '0'); monkeypatch.setenv('WORLD_SIZE', '1')
     # Undo prepare's environment update on fixture completion.
     for key in ('PYTHONPATH', 'CUDA_VISIBLE_DEVICES', 'DIFFSYNTH_SKIP_DOWNLOAD'):
         monkeypatch.setenv(key, 'TEST-only-previous')
-    ranks = [{'rank': r, 'world_size': 8, 'global_batch': 128, 'batch_per_rank': 16,
+    ranks = [{'rank': r, 'world_size': world, 'global_batch': world*16, 'batch_per_rank': 16,
         'actual_engine_updates': 2, 'adam_state_steps': [2], 'accepted': True,
         'all_parameters_finite': True, 'adam_master_and_moments_finite': True,
         'updates': [{'global_loss': 1., 'optimizer_step_was_skipped': False, 'seconds': 3.5}] * 2,
         'teacher_layer_calls': [2] * 30, 'dataset': {'verified': True}, 'startup_seconds': 100,
         'local_adam_master_and_moments_bytes': 12, 'architecture_counts': {'optimizer_parameters': 1}}
-        for r in range(8)]
+        for r in range(world)]
     calls = []
     def fake_execute(argv, cwd, output, seconds, **kwargs):
         calls.append(argv)
-        probe = ssd / 'fastwam-forcewm-train-current-fixture-two-adam-v6'; probe.mkdir()
+        probe = ssd / f'fastwam-forcewm-{allocation}-two-adam-{version}'; probe.mkdir()
         (probe / 'preflight.json').write_text(json.dumps({'status': 'two_adam_verified', 'ranks': ranks}))
         out = Path(output); out.mkdir()
         receipt = {'status': 'process_exited_zero', 'returncode': 0, 'command': argv,
-            'absolute_deadline_unix': job.DEADLINE, 'subreaper_restored': True,
+            'absolute_deadline_unix': kwargs['deadline_unix'], 'limit_seconds': seconds, 'subreaper_restored': True,
             'ownership': {'closure_verified': True, 'errors': [], 'signals': [], 'live_after_cleanup': []}}
         (out / 'status.json').write_text(json.dumps(receipt))
         return receipt
     monkeypatch.setattr(job, 'execute', fake_execute)
-    folder = base / 'distributed-train-current-fixture-v6'; folder.mkdir()
-    (folder / 'dispatch.json').write_text(json.dumps({'started_unix': 1791777900}))
-    p = job.prepare(source, 'train-current-fixture', folder)
+    folder = base / 'distributed-train-current-fixture-v7'; folder.mkdir()
+    (folder / 'dispatch.json').write_text(json.dumps({'started_unix': now-100}))
+    p = job.prepare(source, allocation, folder, interactive=interactive)
     assert len(calls) == 1
     assert calls[0][0] == str(job.NATIVE)
     assert calls[0][11:13] == ['-m', 'fastwam.forcewm.preflight']
     assert p['argv'][11] == str(source / 'scripts/forcewm/train_resolved.py')
     assert p['argv'][0] == str(job.NATIVE)
-    assert p['deadline_unix'] == job.DEADLINE
-    assert guard.validate_plan(p, 1791778000) > 0
-    assert p['world_size'] == 8 and p['global_batch'] == 128
-    assert p['environment']['CUDA_VISIBLE_DEVICES'] == '0,1,2,3,4,5,6,7'
-    assert p['argv'][5:7] == ['--num_processes', '8']
-    assert p['argv'][-2:] == ['--expected-world-size', '8']
+    assert p['deadline_unix'] is None
+    assert p['budget_anchor']=='formal_launcher_start'
+    assert p['duration_seconds']==180000
+    assert p['probe_deadline_unix']==now+1860
+    assert guard.validate_plan(p, now)==179940
+    assert p['schema']==(guard.INTERACTIVE4_SCHEMA if world==4 else guard.INTERACTIVE_SCHEMA if interactive else guard.LAUNCH_SCHEMA)
+    assert p['allocation_id']==allocation
+    assert p['world_size'] == world and p['global_batch'] == world*16
+    assert p['environment']['CUDA_VISIBLE_DEVICES'] == ','.join(map(str,range(world)))
+    assert p['argv'][5:7] == ['--num_processes', str(world)]
+    if world==8: assert p['argv'][-2:] == ['--expected-world-size', '8']
+    else: assert p['argv'][-2:]==['--origins',p['origins']]
     assert p['distributed_resume_verified'] is False
     assert 'RANK' not in job.os.environ and 'WORLD_SIZE' not in job.os.environ
-
-
-def test_eight_rank_probe_budget_does_not_assume_four_rank_speed():
-    # This is after the old four-rank estimate cutoff. A bounded fresh probe
-    # remains permitted; formal validation still requires measured 8-rank fit.
-    job.require_probe_budget(job.DEADLINE - 30 * 3600)
-    with pytest.raises(ValueError, match='Insufficient'):
-        job.require_probe_budget(job.DEADLINE - 1800)
 
 
 def test_rank_mismatch_rejected_before_model_initialization():

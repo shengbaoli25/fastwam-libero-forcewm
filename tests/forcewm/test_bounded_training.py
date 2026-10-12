@@ -303,3 +303,119 @@ def test_eight_rank_completion_rejects_missing_upper_rank(plan, monkeypatch, mis
     file = Path(p['origins']) / 'rank_007.json' if missing == 'origin7' else state / 'random_states_7.pkl'
     file.unlink()
     with pytest.raises((FileNotFoundError, ValueError)): guard.verify_completion(p)
+
+
+def launch_relative_fixture(plan, monkeypatch):
+    p=distributed8_fixture(plan,monkeypatch)
+    p.update(schema=guard.LAUNCH_SCHEMA,budget_anchor='formal_launcher_start',duration_seconds=180000,
+        deadline_unix=None,allocation_created_unix=1792000000,
+        human_duration_approval=guard.LAUNCH_APPROVAL,probe_deadline_unix=1792001960)
+    del p['original_budget_anchor_unix']
+    prep=Path(p['preparation']);value=json.loads(prep.read_text())
+    value.update(probe_started_unix=1792000100,probe_deadline_unix=p['probe_deadline_unix'])
+    prep.write_text(json.dumps(value));p['input_sha256'][str(prep)]=guard.sha(prep)
+    outer=Path(p['probe_supervisor']);value=json.loads(outer.read_text())
+    value.update(absolute_deadline_unix=p['probe_deadline_unix'],limit_seconds=1799)
+    outer.write_text(json.dumps(value));p['input_sha256'][str(outer)]=guard.sha(outer)
+    return p
+
+
+def test_launch_relative50h_survives_queue_past_old_absolute_deadline(plan,monkeypatch):
+    p=launch_relative_fixture(plan,monkeypatch)
+    assert guard.validate_plan(p,1792000200)==179940
+    assert guard.validate_plan(p,1792001000)==179940
+
+
+@pytest.mark.parametrize('drift',['duration','anchor','prior_anchor','preset_deadline','preset_start',
+    'future_created','nan_created','nan_now','approval','wrong_job','copied_restart',
+    'probe_deadline','prep_probe_deadline','probe_start','unbounded_probe','estimated_nan',
+    'too_slow','relaunch_output','relaunch_watch'])
+def test_launch_relative_rejects_reset_and_unbound_evidence(plan,monkeypatch,drift):
+    p=launch_relative_fixture(plan,monkeypatch);now=1792000200
+    if drift=='duration':p['duration_seconds']+=3600
+    elif drift=='anchor':p['budget_anchor']='allocation_created'
+    elif drift=='prior_anchor':p['original_budget_anchor_unix']=1791734545
+    elif drift=='preset_deadline':p['deadline_unix']=now+180000
+    elif drift=='preset_start':p['formal_launcher_started_unix']=now
+    elif drift=='future_created':p['allocation_created_unix']=now+1
+    elif drift=='nan_created':p['allocation_created_unix']=float('nan')
+    elif drift=='nan_now':now=float('nan')
+    elif drift=='approval':p['human_duration_approval']='old fixed50h approval'
+    elif drift=='wrong_job':monkeypatch.setenv('TRAIN_JOB_ID','different-job')
+    elif drift=='copied_restart':p['restart_from_failed_plan']='old-plan'
+    elif drift=='estimated_nan':p['estimated_required_seconds']=float('nan')
+    elif drift.startswith('relaunch_'):
+        Path(p['training_output' if drift=='relaunch_output' else 'supervision_output']).mkdir()
+    else:
+        key='preflight' if drift=='too_slow' else 'preparation' if drift in ('prep_probe_deadline','probe_start') else 'probe_supervisor'
+        path=Path(p[key]);v=json.loads(path.read_text())
+        if drift=='too_slow':v['ranks'][7]['updates'][-1]['seconds']=6.
+        elif drift in ('probe_deadline','prep_probe_deadline'):
+            v['absolute_deadline_unix' if drift=='probe_deadline' else 'probe_deadline_unix']+=1
+        elif drift=='probe_start':v['probe_started_unix']=now+1
+        else:v['limit_seconds']=3600
+        path.write_text(json.dumps(v));p['input_sha256'][str(path)]=guard.sha(path)
+    with pytest.raises(ValueError):guard.validate_plan(p,now)
+
+
+def interactive_fixture(plan, monkeypatch):
+    p=launch_relative_fixture(plan,monkeypatch)
+    p.update(schema=guard.INTERACTIVE_SCHEMA,allocation_id=guard.INTERACTIVE_ALLOCATION,
+        execution_mode='foreground_interactive_modeling')
+    monkeypatch.delenv('TRAIN_JOB_ID')
+    monkeypatch.setenv('FORCEWM_INTERACTIVE_ALLOCATION_ID',guard.INTERACTIVE_ALLOCATION)
+    f=Path(p['preparation']);v=json.loads(f.read_text())
+    v.update(allocation_id=p['allocation_id'],execution_mode=p['execution_mode'],
+        hardware='\n'.join(f'{r}, H100, TEST-only' for r in range(8)))
+    f.write_text(json.dumps(v));p['input_sha256'][str(f)]=guard.sha(f)
+    return p
+
+
+def test_interactive_current_eight_h100_plan(plan,monkeypatch):
+    p=interactive_fixture(plan,monkeypatch)
+    assert guard.validate_plan(p,1792000200)==179940
+
+
+@pytest.mark.parametrize('drift',['identity','mode','missing_binding','distributed_impersonation',
+    'old_receipt','old_gpu','four_gpu','old_probe_deadline'])
+def test_interactive_rejects_old_or_mismatched_allocation(plan,monkeypatch,drift):
+    p=interactive_fixture(plan,monkeypatch)
+    if drift=='identity':p['allocation_id']='other-notebook'
+    elif drift=='mode':p['execution_mode']='foreground_distributed_training'
+    elif drift=='missing_binding':monkeypatch.delenv('FORCEWM_INTERACTIVE_ALLOCATION_ID')
+    elif drift=='distributed_impersonation':monkeypatch.setenv('TRAIN_JOB_ID','spoofed-job')
+    else:
+        f=Path(p['preparation']);v=json.loads(f.read_text())
+        if drift=='old_receipt':v['allocation_id']='old-notebook'
+        elif drift=='old_gpu':v['hardware']=v['hardware'].replace('H100','H200')
+        elif drift=='four_gpu':v['hardware']='\n'.join(v['hardware'].splitlines()[:4])
+        else:v['probe_deadline_unix']-=1
+        f.write_text(json.dumps(v));p['input_sha256'][str(f)]=guard.sha(f)
+    with pytest.raises(ValueError):guard.validate_plan(p,1792000200)
+
+
+def interactive4_fixture(plan,monkeypatch):
+    p=interactive_fixture(plan,monkeypatch)
+    p.update(schema=guard.INTERACTIVE4_SCHEMA,allocation_id=guard.INTERACTIVE4_ALLOCATION,
+        world_size=4,global_batch=64)
+    monkeypatch.setenv('FORCEWM_INTERACTIVE_ALLOCATION_ID',guard.INTERACTIVE4_ALLOCATION)
+    p['environment']['CUDA_VISIBLE_DEVICES']='0,1,2,3'
+    p['argv'][4]=p['argv'][4].replace('_8gpu','_4gpu');p['argv'][6]='4';p['argv']=p['argv'][:-2]
+    f=Path(p['preflight']);v=json.loads(f.read_text());v['ranks']=v['ranks'][:4]
+    for r in v['ranks']:r.update(world_size=4,global_batch=64)
+    f.write_text(json.dumps(v));p['input_sha256'][str(f)]=guard.sha(f)
+    probe=p['argv'][:11]+['-m','fastwam.forcewm.preflight','--config',p['config'],
+        '--output',str(f.parent),'--expected-world-size','4','--execute']
+    f=Path(p['preparation']);v=json.loads(f.read_text())
+    v.update(allocation_id=p['allocation_id'],hardware='\n'.join(f'{r}, H200, TEST-only' for r in range(4)),probe_argv=probe)
+    f.write_text(json.dumps(v));p['input_sha256'][str(f)]=guard.sha(f)
+    f=Path(p['probe_supervisor']);v=json.loads(f.read_text());v['command']=probe
+    f.write_text(json.dumps(v));p['input_sha256'][str(f)]=guard.sha(f)
+    return p
+
+
+def test_current_four_h200_launch_relative_contract(plan,monkeypatch):
+    p=interactive4_fixture(plan,monkeypatch)
+    assert guard.validate_plan(p,1792000200)==179940
+    p['world_size']=8;p['global_batch']=128
+    with pytest.raises(ValueError):guard.validate_plan(p,1792000200)

@@ -10,8 +10,22 @@ from datetime import datetime,timezone
 from process_ownership import ProcessOwnership
 
 
-def execute(command,cwd,output,seconds,*,maximum_seconds=3600,deadline_unix=None,log_name='probe.log',phase='forcewm-two-adam'):
-    if not 1<=seconds<=maximum_seconds<=172800:raise ValueError('Execution exceeds its bounded time allowance')
+def execute(command,cwd,output,seconds,*,maximum_seconds=3600,deadline_unix=None,log_name='probe.log',phase='forcewm-two-adam',duration_from_launch_seconds=None,execution_identity=None):
+    if execution_identity is not None:
+        if (duration_from_launch_seconds is None or not isinstance(execution_identity,dict)
+                or execution_identity.get('kind')!='interactive_modeling'
+                or execution_identity.get('allocation_id')!=os.environ.get('FORCEWM_INTERACTIVE_ALLOCATION_ID')
+                or not execution_identity.get('allocation_id') or os.environ.get('TRAIN_JOB_ID')
+                or set(execution_identity)!={'kind','allocation_id'}):
+            raise ValueError('Explicit current interactive identity required; no distributed impersonation')
+    cap=180000 if duration_from_launch_seconds is not None else 172800
+    if not 1<=seconds<=maximum_seconds<=cap:raise ValueError('Execution exceeds its bounded time allowance')
+    if duration_from_launch_seconds is not None:
+        if (type(duration_from_launch_seconds) is not int
+                or duration_from_launch_seconds != 180000 or maximum_seconds != 180000
+                or seconds != 179940 or deadline_unix is not None
+                or phase != 'forcewm-formal30000'):
+            raise ValueError('Launch-relative allowance requires the authorized50h formal phase')
     if deadline_unix is not None:
         seconds=min(seconds,deadline_unix-time.time()-60)
         if seconds<1:raise ValueError('Absolute deadline has no execution and cleanup time remaining')
@@ -28,9 +42,27 @@ def execute(command,cwd,output,seconds,*,maximum_seconds=3600,deadline_unix=None
         for s in handlers:signal.signal(s,lambda s,f:pending.append(s))
         tracker.enable_subreaper()
         with (output/log_name).open('xb') as log:
+            launched_unix=time.time();launched_monotonic=time.monotonic()
             child=subprocess.Popen(command,cwd=cwd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            if duration_from_launch_seconds is not None:
+                deadline_unix=launched_unix+duration_from_launch_seconds
+                end=launched_monotonic+seconds
+                result.update(launcher_started_unix=launched_unix,
+                    absolute_deadline_unix=deadline_unix,budget_anchor='formal_launcher_start',
+                    duration_seconds=duration_from_launch_seconds)
             tracker.attach_launcher(child,phase=phase)
-        tracker.register_launcher(child,phase=phase);result['status']='running';save()
+        launcher=tracker.register_launcher(child,phase=phase)
+        if duration_from_launch_seconds is not None:
+            # Exclusive output and receipt: this run cannot reset its clock.
+            receipt={k:result[k] for k in ('command','launcher_started_unix',
+                'absolute_deadline_unix','budget_anchor','duration_seconds')}
+            receipt.update(launcher_pid=launcher['pid'],launcher_start_ticks=launcher['start_ticks'],
+                           platform_job_id=os.environ.get('TRAIN_JOB_ID'),
+                           execution_identity=execution_identity)
+            with (output/'formal-launch.json').open('x') as stream:
+                json.dump(receipt,stream,indent=2,allow_nan=False)
+            print('FORMAL_ACTUAL_LAUNCH',json.dumps(receipt),flush=True)
+        result['status']='running';save()
         while child.poll() is None:
             tracker.observe()
             if pending:raise RuntimeError('Probe interrupted')
