@@ -23,6 +23,31 @@ def test_current_job_identity():
     assert job.platform_identity({'TRAIN_JOB_ID': 'train-valid'}) == 'train-valid'
 
 
+@pytest.mark.parametrize('count', [4, 8])
+def test_hardware_check_accepts_an_h200_node_for_four_rank_execution(monkeypatch, count):
+    gpu = '\n'.join(f'{index}, NVIDIA H200, 143771 MiB, GPU-{index}' for index in range(count))
+    responses = iter([gpu, ''])
+
+    class Result:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    monkeypatch.setattr(job.subprocess, 'run', lambda *args, **kwargs: Result(next(responses)))
+    monkeypatch.setattr(job.os, 'pidfd_open', lambda *args: 77)
+    monkeypatch.setattr(job.signal, 'pidfd_send_signal', lambda *args: None)
+    monkeypatch.setattr(job.os, 'close', lambda *args: None)
+    assert job.hardware_check() == gpu
+
+
+def test_hardware_check_rejects_an_incomplete_or_wrong_gpu_allocation(monkeypatch):
+    class Result:
+        stdout = '0, NVIDIA H100, 81559 MiB, GPU-0\n1, NVIDIA H100, 81559 MiB, GPU-1'
+
+    monkeypatch.setattr(job.subprocess, 'run', lambda *args, **kwargs: Result())
+    with pytest.raises(ValueError, match='four or eight H200'):
+        job.hardware_check()
+
+
 def test_prepare_uses_current_probe_and_exact_native_formal_argv(tmp_path, monkeypatch):
     source = tmp_path / 'source'
     for name in ('src/fastwam/forcewm/model.py', 'scripts/forcewm/train_resolved.py',

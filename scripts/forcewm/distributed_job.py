@@ -51,8 +51,12 @@ def write_new(path, value):
 def hardware_check():
     gpu = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total,uuid',
                           '--format=csv,noheader'], capture_output=True, text=True, check=True).stdout
-    if len(gpu.strip().splitlines()) != 4 or not all('H200' in line for line in gpu.strip().splitlines()):
-        raise ValueError('Actual four H200 GPUs required for this job')
+    physical_gpus = [line for line in gpu.strip().splitlines() if line]
+    # The pool may allocate a whole eight-GPU H200 node.  This job deliberately
+    # exposes only devices 0..3 to Accelerate, retaining the approved four
+    # ranks and global batch 64 while recording the complete allocation.
+    if len(physical_gpus) not in (4, 8) or not all('H200' in line for line in physical_gpus):
+        raise ValueError('Actual allocation must contain four or eight H200 GPUs')
     apps = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,process_name',
                            '--format=csv,noheader'], capture_output=True, text=True, check=True).stdout
     if apps.strip():
