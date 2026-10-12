@@ -60,10 +60,12 @@ def read_proc(pid):
     # Unrelated kernel threads legitimately have PGID/session 0. Actual owned
     # launchers are separately required to establish positive isolated IDs.
     if result["pid"] != pid or result["pgid"] < 0 or result["session"] < 0 or result["start_ticks"] < 0:
-        # Actual target evidence: state X can expose PGID/session -1 as the task
-        # disappears. Only accept its disappearance; a persistent invalid row
-        # still fails closed and can never become a signal/ownership identity.
-        if result["pid"] == pid and result["state"] == "X" and result["start_ticks"] >= 0:
+        # Actual target evidence includes both X and Z with PGID/session -1
+        # during exit. A Z row is not by itself proof of disappearance: only
+        # skip after a second read proves the PID is gone. Persistent invalid
+        # rows and PID reuse still fail closed; valid zombies remain tracked
+        # for reaping. Never use invalid group/session values as identities.
+        if result["pid"] == pid and result["state"] in {"X", "Z"} and result["start_ticks"] >= 0:
             try:
                 Path(f"/proc/{pid}/stat").read_text()
             except (FileNotFoundError, ProcessLookupError):
