@@ -170,3 +170,29 @@ def test_restart_rejects_unvalidated_changes(plan,tmp_path,drift):
     elif drift=='different_allocation':p['allocation_id']='another'
     else:p['preflight']=p['preparation']
     with pytest.raises((ValueError,KeyError)):guard.validate_plan(p,1100)
+
+
+def approved_50h_plan(plan,tmp_path):
+    plan['allocation_id']='ab5d6993-795b-4bf7-9084-e59f089e7788'
+    recovery_plan(plan)
+    p=restart_fixture(plan,tmp_path)
+    p.update(schema='forcewm-restart50h-v4',deadline_unix=1791914545,
+             human_duration_approval='同意延长到50小时并重启')
+    return p
+
+
+def test_explicit_50h_restart_retains_original_budget_anchor(plan,tmp_path):
+    p=approved_50h_plan(plan,tmp_path)
+    assert guard.validate_plan(p,1791778000)==136485
+    assert p['deadline_unix']-p['original_budget_anchor_unix']==50*3600
+
+@pytest.mark.parametrize('change',['reset_clock','unapproved','allocation','anchor','insufficient','recipe'])
+def test_50h_restart_rejects_unauthorized_drift(plan,tmp_path,change):
+    p=approved_50h_plan(plan,tmp_path);now=1791778000
+    if change=='reset_clock':p['deadline_unix']=now+50*3600
+    elif change=='unapproved':p['human_duration_approval']=''
+    elif change=='allocation':p['allocation_id']='different'
+    elif change=='anchor':p['original_budget_anchor_unix']+=1
+    elif change=='insufficient':now=p['deadline_unix']-1000
+    else:p['global_batch']=128
+    with pytest.raises(ValueError):guard.validate_plan(p,now)

@@ -14,7 +14,7 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def validate_plan(plan,now):
-    if (plan['schema'] not in ('forcewm-h100-formal-v1','forcewm-recovery48h-v2') or plan['world_size']!=4
+    if (plan['schema'] not in ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4') or plan['world_size']!=4
             or plan['batch_per_rank']!=16 or plan['global_batch']!=64 or plan['max_steps']!=30000
             or plan['gradient_accumulation_steps']!=1):
         raise ValueError('Exact authorized ForceWM training recipe required')
@@ -22,14 +22,20 @@ def validate_plan(plan,now):
         if plan['deadline_unix']-plan['allocation_created_unix']!=40*3600:
             raise ValueError('Deadline must remain allocation creation plus40h')
     else:
-        # Oct12 explicit human approval extends the original budget anchor to
-        #48h. A replacement allocation must not restart that clock.
+        # Each explicit Oct12 approval extends the ORIGINAL budget anchor.
+        # Replacing an allocation or restarting training never resets it.
+        deadline=1791914545 if plan['schema']=='forcewm-restart50h-v4' else 1791907345
         if (plan.get('original_budget_anchor_unix')!=1791734545
-                or plan['deadline_unix']!=1791907345
+                or plan['deadline_unix']!=deadline
                 or plan.get('recovery_of_allocation_id')!='b2c145b8-a54c-46e0-8580-919ec0549792'
                 or type(plan['allocation_created_unix']) not in (int,float)
                 or not 1791734545<=plan['allocation_created_unix']<=now):
-            raise ValueError('Recovery must retain the explicit fixed48h authorization')
+            raise ValueError('Recovery must retain its explicit fixed deadline')
+        if plan['schema']=='forcewm-restart50h-v4' and (
+                plan.get('allocation_id')!='ab5d6993-795b-4bf7-9084-e59f089e7788'
+                or not plan.get('restart_from_failed_plan')
+                or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
+            raise ValueError('The fixed50h approval applies only to this authorized restart')
     remaining=plan['deadline_unix']-now
     source=Path(plan['source']); config=plan['config']
     expected_argv=[plan['native_python'],'-m','accelerate.commands.launch','--config_file',
@@ -154,7 +160,7 @@ def main():
         print(json.dumps({'status':'plan_verified','seconds_available':remaining}));return
     os.environ.update(plan['environment'])
     result=execute(plan['argv'],plan['source'],plan['supervision_output'],remaining,
-                   maximum_seconds=172800 if plan['schema']=='forcewm-recovery48h-v2' else 144000,
+                   maximum_seconds=144000 if plan['schema']=='forcewm-h100-formal-v1' else 172800,
                    deadline_unix=plan['deadline_unix'],
                    log_name='training.log',phase='forcewm-formal30000')
     final={'status':'failed','supervisor_status':result['status'],'formal_training_started':True,
