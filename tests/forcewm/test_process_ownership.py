@@ -63,11 +63,11 @@ def test_valid_zombie_is_preserved_for_owned_reaping(monkeypatch):
     }
 
 
-def test_reused_pid_on_confirmation_is_not_disappearance(monkeypatch):
+def test_valid_later_identity_after_terminal_race_is_returned_without_old_ownership(monkeypatch):
     reads = iter([stat_row(), stat_row(state="R", pgid=66897, session=66897, start=1906410122)])
     monkeypatch.setattr(Path, "read_text", lambda path: next(reads))
-    with pytest.raises(ownership.OwnershipError, match="Invalid Linux process identity"):
-        ownership.read_proc(66897)
+    actual = ownership.read_proc(66897)
+    assert actual['start_ticks'] == 1906410122 and actual['state'] == 'R'
 
 
 def test_permission_denied_on_confirmation_is_not_disappearance(monkeypatch):

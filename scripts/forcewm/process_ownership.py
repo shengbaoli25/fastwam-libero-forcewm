@@ -40,7 +40,7 @@ class OwnershipError(RuntimeError):
     pass
 
 
-def read_proc(pid):
+def read_proc(pid, *, _confirm_terminal=True):
     """Read Linux process identity, or None after disappearance; no signalling."""
     if type(pid) is not int or pid <= 0:
         raise OwnershipError("Process PID must be a positive integer")
@@ -62,14 +62,17 @@ def read_proc(pid):
     if result["pid"] != pid or result["pgid"] < 0 or result["session"] < 0 or result["start_ticks"] < 0:
         # Actual target evidence includes both X and Z with PGID/session -1
         # during exit. A Z row is not by itself proof of disappearance: only
-        # skip after a second read proves the PID is gone. Persistent invalid
-        # rows and PID reuse still fail closed; valid zombies remain tracked
+        # skip after a second read proves the PID is gone. A valid later-start
+        # identity also proves the old process is gone, and must be discovered
+        # independently. Persistent invalid rows fail closed; zombies are tracked
         # for reaping. Never use invalid group/session values as identities.
-        if result["pid"] == pid and result["state"] in {"X", "Z"} and result["start_ticks"] >= 0:
-            try:
-                Path(f"/proc/{pid}/stat").read_text()
-            except (FileNotFoundError, ProcessLookupError):
+        if (_confirm_terminal and result["pid"] == pid and result["state"] in {"X", "Z"}
+                and result["start_ticks"] >= 0):
+            replacement = read_proc(pid, _confirm_terminal=False)
+            if replacement is None:
                 return None
+            if replacement["start_ticks"] > result["start_ticks"]:
+                return replacement
         raise OwnershipError("Invalid Linux process identity: " + json.dumps(result, sort_keys=True))
     return result
 
@@ -127,6 +130,7 @@ class ProcessOwnership:
         self.launcher = None
         self.registration_complete = False
         self.records = {}
+        self.retired_records = {}
         self.current = {}
         self.signals = []
         self.reaped = []
@@ -134,6 +138,30 @@ class ProcessOwnership:
         self.closed = False
         self.cleanup_finished = None
         self._latest_scan = {}
+
+    def _retire_replaced(self, row, replacement):
+        """A later start at the same PID proves the old identity has exited.
+
+        Retain its full ancestry as evidence, but never transfer that ownership
+        to the replacement. observe() must independently discover any new child.
+        """
+        if replacement["pid"] != row["pid"] or replacement["start_ticks"] <= row["start_ticks"]:
+            self._error("Invalid replacement process identity: " + str(row["pid"]))
+            raise OwnershipError(self.errors[-1])
+        known = self.records.get(row["pid"])
+        identity_record = known if known is not None and known["start_ticks"] == row["start_ticks"] else row
+        if (self.launcher is not None and identity_record.get("discovered_by") == "registered_launcher"
+                and self.launcher.returncode is None):
+            self._error("Unreaped launcher identity changed")
+            raise OwnershipError(self.errors[-1])
+        if known is not None and known["start_ticks"] == row["start_ticks"]:
+            self.retired_records[(row["pid"], row["start_ticks"])] = {
+                **known, "retired_reason": "later_start_at_same_pid",
+                "replacement_identity": _identity(replacement)}
+            del self.records[row["pid"]]
+        current = self.current.get(row["pid"])
+        if current is not None and current["start_ticks"] == row["start_ticks"]:
+            del self.current[row["pid"]]
 
     def _error(self, message):
         if message not in self.errors:
@@ -213,13 +241,13 @@ class ProcessOwnership:
         if actual_owner is None or actual_owner["start_ticks"] != self.owner["start_ticks"]:
             self._error("Caller PID identity changed")
             raise OwnershipError(self.errors[-1])
-        changed, bad_reuse = False, False
+        changed = False
         current = {}
-        for pid, known in self.records.items():
+        for pid, known in list(self.records.items()):
             row = scan.get(pid)
             if row is not None and row["start_ticks"] != known["start_ticks"]:
-                self._error("Refusing reused PID: " + str(pid))
-                bad_reuse = True
+                self._retire_replaced(known, row)
+                changed = True
                 continue
             if row is not None:
                 changed = changed or any(known[key] != row[key] for key in ("ppid", "pgid", "session"))
@@ -243,6 +271,12 @@ class ProcessOwnership:
                 if parent is not None and parent["start_ticks"] > row["start_ticks"]:
                     continue  # inconsistent non-atomic /proc sample; retry later
                 if parent is not None:
+                    actual_parent = read_proc(parent["pid"])
+                    if actual_parent is None or actual_parent["start_ticks"] != parent["start_ticks"]:
+                        continue  # never inherit ownership from a reused parent PID
+                if adopted and row["start_ticks"] < self.owner["start_ticks"]:
+                    continue
+                if parent is not None:
                     chain = [*self.records[parent["pid"]]["ancestry"], _identity(parent)]
                     reason = "observed_descendant"
                 else:
@@ -253,8 +287,6 @@ class ProcessOwnership:
                 current[pid] = row
                 changed = progress = True
         self.current = current
-        if bad_reuse:
-            raise OwnershipError("Refusing reused process identity")
         return changed
 
     def _signal_pid(self, row, signum, reason):
@@ -273,7 +305,7 @@ class ProcessOwnership:
             if actual is None:
                 return
             if actual["start_ticks"] != row["start_ticks"]:
-                self._error("Refusing reused PID after pidfd_open: " + str(row["pid"]))
+                self._retire_replaced(row, actual)
                 return
             try:
                 signal.pidfd_send_signal(descriptor, signum, None, 0)
@@ -296,7 +328,7 @@ class ProcessOwnership:
             if actual is None:
                 continue
             if actual["start_ticks"] != row["start_ticks"]:
-                self._error("Refusing reused PID before reap: " + str(row["pid"]))
+                self._retire_replaced(row, actual)
                 continue
             try:
                 pid, status = os.waitpid(row["pid"], os.WNOHANG)
@@ -362,11 +394,13 @@ class ProcessOwnership:
         return self.evidence()
 
     def evidence(self):
+        records = [*self.retired_records.values(), *self.records.values()]
         value = {"schema": SCHEMA, "owner": dict(self.owner), "phase": self.phase,
                  "pidfd_signalling_required": True,
                  "subreaper_enabled": self.enabled, "prior_subreaper_enabled": self.prior_enabled,
-                 "tracked_processes": [dict(self.records[pid]) for pid in sorted(self.records)],
-                 "owned_pgids": sorted(set(row["pgid"] for row in self.records.values())),
+                 "tracked_processes": [dict(row) for row in sorted(records, key=lambda row: (row["pid"], row["start_ticks"]))],
+                 "retired_identity_count": len(self.retired_records),
+                 "owned_pgids": sorted(set(row["pgid"] for row in records)),
                  "signals": list(self.signals), "reaped": list(self.reaped),
                  "live_after_cleanup": [dict(row) for row in sorted(self.current.values(), key=lambda row: row["pid"])],
                  "closure_verified": self.closed,

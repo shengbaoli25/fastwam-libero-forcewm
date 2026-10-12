@@ -53,7 +53,36 @@ def validate_plan(plan,now):
     native=json.loads(Path(plan['preflight']).read_text())
     outer=json.loads(Path(plan['probe_supervisor']).read_text())
     preparation=json.loads(Path(plan['preparation']).read_text())
-    if preparation['resolved_config_sha256']!=sha(config):
+    if plan.get('restart_from_failed_plan'):
+        # Reuse the real same-allocation GPU probe only for identical model and
+        # training code. A new output directory and repaired outer guard do not
+        # justify relabelling a copied receipt as a new GPU test.
+        prior_path=plan['restart_from_failed_plan']
+        if prior_path not in plan['input_sha256']:
+            raise ValueError('Original failed plan must be hash-bound')
+        prior=json.loads(Path(prior_path).read_text())
+        prior_source=Path(prior['source']);prior_config=Path(prior['config'])
+        if (prior['allocation_id']!=plan['allocation_id'] or prior['preflight']!=plan['preflight']
+                or prior['probe_supervisor']!=plan['probe_supervisor']
+                or prior['preparation']!=plan['preparation']
+                or preparation['resolved_config_sha256']!=sha(prior_config)
+                or sha(prior_config)!=prior['input_sha256'][str(prior_config)]):
+            raise ValueError('Restart must reuse the actual same-allocation probe')
+        old_lines=prior_config.read_text().splitlines();new_lines=Path(config).read_text().splitlines()
+        if (not old_lines or not new_lines or new_lines[0]!='output_dir: '+plan['training_output']
+                or old_lines[0]!='output_dir: '+prior['training_output'] or old_lines[1:]!=new_lines[1:]):
+            raise ValueError('Restart may change only the output directory in GPU-validated config')
+        for folder in ('src','scripts/forcewm'):
+            old_files={str(p.relative_to(prior_source)) for p in (prior_source/folder).rglob('*.py')}
+            new_files={str(p.relative_to(source)) for p in (source/folder).rglob('*.py')}
+            if old_files!=new_files:raise ValueError('Restart source file set changed')
+            for name in old_files-{'scripts/forcewm/process_ownership.py','scripts/forcewm/bounded_training.py'}:
+                if sha(source/name)!=prior['input_sha256'][str(prior_source/name)]:
+                    raise ValueError('GPU-validated training code changed: '+name)
+        for name in ('scripts/accelerate_configs/accelerate_zero1_ds_4gpu.yaml','scripts/ds_configs/ds_zero1_config.json'):
+            if sha(source/name)!=prior['input_sha256'][str(prior_source/name)]:
+                raise ValueError('GPU-validated distributed config changed')
+    elif preparation['resolved_config_sha256']!=sha(config):
         raise ValueError('Resolved config differs from actual GPU probe')
     if plan['forcewm_source_inventory']!=preparation['source_inventory']:
         raise ValueError('GPU-validated ForceWM inventory differs')

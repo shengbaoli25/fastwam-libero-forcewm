@@ -135,3 +135,38 @@ def test_absolute_deadline_closes_owned_session(tmp_path):
     assert r['status']=='failed' and r['ownership']['closure_verified']
     assert r['ownership']['signals'] and not r['ownership']['live_after_cleanup']
     assert r['subreaper_restored']
+
+
+def restart_fixture(plan,tmp_path):
+    import shutil
+    config=Path(plan['config']);config.write_text('output_dir: '+plan['training_output']+'\nmax_steps: 30000\nsave_freq: 5000\n')
+    prep=Path(plan['preparation']);p=json.loads(prep.read_text());p['resolved_config_sha256']=guard.sha(config);prep.write_text(json.dumps(p))
+    for f in (config,prep):plan['input_sha256'][str(f)]=guard.sha(f)
+    prior=tmp_path/'prior.json';prior.write_text(json.dumps(plan))
+    old_source=Path(plan['source']);source=tmp_path/'new-source';shutil.copytree(old_source,source)
+    new=copy.deepcopy(plan);new.update(source=str(source),training_output=str(tmp_path/'new-output'),
+        origins=str(tmp_path/'new-origins'),supervision_output=str(tmp_path/'new-watch'),restart_from_failed_plan=str(prior))
+    new_config=tmp_path/'new.yaml';new_config.write_text(config.read_text().replace(plan['training_output'],new['training_output']))
+    new['config']=str(new_config)
+    new['environment']['PYTHONPATH']=str(source/'src')+':'+str(source)
+    new['argv']=[s.replace(str(old_source),str(source)).replace(str(config),str(new_config)).replace(plan['origins'],new['origins']) for s in plan['argv']]
+    new['input_sha256'].update({str(p):guard.sha(p) for p in source.rglob('*') if p.is_file()})
+    for p in (new_config,prior):new['input_sha256'][str(p)]=guard.sha(p)
+    return new
+
+
+def test_restart_reuses_actual_probe_without_claiming_retest(plan,tmp_path):
+    plan['allocation_id']='TEST-only'
+    p=restart_fixture(plan,tmp_path)
+    assert guard.validate_plan(p,1100)==143840
+
+@pytest.mark.parametrize('drift',['recipe','model','distributed','prior_binding','different_allocation','probe'])
+def test_restart_rejects_unvalidated_changes(plan,tmp_path,drift):
+    plan['allocation_id']='TEST-only';p=restart_fixture(plan,tmp_path)
+    if drift in ('recipe','model','distributed'):
+        path=Path(p['config'] if drift=='recipe' else str(Path(p['source'])/('src/fastwam/forcewm/model.py' if drift=='model' else 'scripts/ds_configs/ds_zero1_config.json')))
+        path.write_text(path.read_text()+'\nchanged');p['input_sha256'][str(path)]=guard.sha(path)
+    elif drift=='prior_binding':del p['input_sha256'][p['restart_from_failed_plan']]
+    elif drift=='different_allocation':p['allocation_id']='another'
+    else:p['preflight']=p['preparation']
+    with pytest.raises((ValueError,KeyError)):guard.validate_plan(p,1100)
