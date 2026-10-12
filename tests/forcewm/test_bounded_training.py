@@ -196,3 +196,45 @@ def test_50h_restart_rejects_unauthorized_drift(plan,tmp_path,change):
     elif change=='insufficient':now=p['deadline_unix']-1000
     else:p['global_batch']=128
     with pytest.raises(ValueError):guard.validate_plan(p,now)
+
+
+def distributed_fixture(plan, monkeypatch):
+    job = 'train-test-current-node'
+    recovery_plan(plan)
+    plan.update(schema='forcewm-distributed50h-v5', allocation_id=job,
+                deadline_unix=1791914545, human_duration_approval='同意延长到50小时并重启',
+                execution_mode='foreground_distributed_training')
+    monkeypatch.setenv('TRAIN_JOB_ID', job)
+    prep = Path(plan['preparation']); value = json.loads(prep.read_text())
+    value.update(allocation_id=job, execution_mode=plan['execution_mode'], current_node_probe=True,
+                 probe_output=str(Path(plan['preflight']).parent), probe_argv=['TEST-only-current-job'])
+    prep.write_text(json.dumps(value)); plan['input_sha256'][str(prep)] = guard.sha(prep)
+    outer = Path(plan['probe_supervisor']); value = json.loads(outer.read_text())
+    value.update(command=['TEST-only-current-job'], absolute_deadline_unix=1791914545)
+    outer.write_text(json.dumps(value)); plan['input_sha256'][str(outer)] = guard.sha(outer)
+    return plan
+
+
+def test_distributed_job_requires_fresh_probe_and_preserves_deadline(plan, monkeypatch):
+    p = distributed_fixture(plan, monkeypatch)
+    assert guard.validate_plan(p, 1791778000) == 136485
+
+
+@pytest.mark.parametrize('drift', ['job_identity', 'old_probe', 'probe_path', 'probe_command',
+                                 'deadline', 'background', 'copied_restart', 'missing_job', 'budget'])
+def test_distributed_rejects_other_job_receipts_and_queue_budget_drift(plan, monkeypatch, drift):
+    p = distributed_fixture(plan, monkeypatch); now = 1791778000
+    if drift == 'job_identity': monkeypatch.setenv('TRAIN_JOB_ID', 'different-job')
+    elif drift == 'missing_job': monkeypatch.delenv('TRAIN_JOB_ID')
+    elif drift == 'background': p['execution_mode'] = 'background'
+    elif drift == 'copied_restart': p['restart_from_failed_plan'] = 'old-notebook-plan'
+    elif drift == 'budget': now = p['deadline_unix'] - 1000
+    else:
+        path = Path(p['preparation'] if drift in ('old_probe', 'probe_path') else p['probe_supervisor'])
+        value = json.loads(path.read_text())
+        if drift == 'old_probe': value['allocation_id'] = 'old-notebook'
+        elif drift == 'probe_path': value['probe_output'] += '-different'
+        elif drift == 'probe_command': value['command'] = ['another-probe']
+        elif drift == 'deadline': value['absolute_deadline_unix'] += 1
+        path.write_text(json.dumps(value)); p['input_sha256'][str(path)] = guard.sha(path)
+    with pytest.raises(ValueError): guard.validate_plan(p, now)

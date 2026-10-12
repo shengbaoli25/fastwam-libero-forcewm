@@ -14,7 +14,7 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def validate_plan(plan,now):
-    if (plan['schema'] not in ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4') or plan['world_size']!=4
+    if (plan['schema'] not in ('forcewm-h100-formal-v1','forcewm-recovery48h-v2','forcewm-restart50h-v4','forcewm-distributed50h-v5') or plan['world_size']!=4
             or plan['batch_per_rank']!=16 or plan['global_batch']!=64 or plan['max_steps']!=30000
             or plan['gradient_accumulation_steps']!=1):
         raise ValueError('Exact authorized ForceWM training recipe required')
@@ -24,7 +24,7 @@ def validate_plan(plan,now):
     else:
         # Each explicit Oct12 approval extends the ORIGINAL budget anchor.
         # Replacing an allocation or restarting training never resets it.
-        deadline=1791914545 if plan['schema']=='forcewm-restart50h-v4' else 1791907345
+        deadline=1791914545 if plan['schema'] in ('forcewm-restart50h-v4','forcewm-distributed50h-v5') else 1791907345
         if (plan.get('original_budget_anchor_unix')!=1791734545
                 or plan['deadline_unix']!=deadline
                 or plan.get('recovery_of_allocation_id')!='b2c145b8-a54c-46e0-8580-919ec0549792'
@@ -36,6 +36,12 @@ def validate_plan(plan,now):
                 or not plan.get('restart_from_failed_plan')
                 or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
             raise ValueError('The fixed50h approval applies only to this authorized restart')
+        if plan['schema']=='forcewm-distributed50h-v5':
+            if (not plan.get('allocation_id') or plan['allocation_id']!=os.environ.get('TRAIN_JOB_ID')
+                    or plan.get('restart_from_failed_plan')
+                    or plan.get('execution_mode')!='foreground_distributed_training'
+                    or plan.get('human_duration_approval')!='同意延长到50小时并重启'):
+                raise ValueError('Distributed restart requires its current TRAIN_JOB_ID and fresh GPU probe')
     remaining=plan['deadline_unix']-now
     source=Path(plan['source']); config=plan['config']
     expected_argv=[plan['native_python'],'-m','accelerate.commands.launch','--config_file',
@@ -59,6 +65,14 @@ def validate_plan(plan,now):
     native=json.loads(Path(plan['preflight']).read_text())
     outer=json.loads(Path(plan['probe_supervisor']).read_text())
     preparation=json.loads(Path(plan['preparation']).read_text())
+    if plan['schema']=='forcewm-distributed50h-v5':
+        if (preparation.get('allocation_id')!=plan['allocation_id']
+                or preparation.get('execution_mode')!=plan['execution_mode']
+                or preparation.get('current_node_probe') is not True
+                or preparation.get('probe_output')!=str(Path(plan['preflight']).parent)
+                or outer.get('command')!=preparation.get('probe_argv')
+                or outer.get('absolute_deadline_unix')!=plan['deadline_unix']):
+            raise ValueError('Actual current-job probe and foreground provenance required')
     if plan.get('restart_from_failed_plan'):
         # Reuse the real same-allocation GPU probe only for identical model and
         # training code. A new output directory and repaired outer guard do not
