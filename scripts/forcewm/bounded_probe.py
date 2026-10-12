@@ -11,7 +11,7 @@ from process_ownership import ProcessOwnership
 
 
 def execute(command,cwd,output,seconds,*,maximum_seconds=3600,deadline_unix=None,log_name='probe.log',phase='forcewm-two-adam'):
-    if not 1<=seconds<=maximum_seconds<=144000:raise ValueError('Execution exceeds its bounded time allowance')
+    if not 1<=seconds<=maximum_seconds<=172800:raise ValueError('Execution exceeds its bounded time allowance')
     if deadline_unix is not None:
         seconds=min(seconds,deadline_unix-time.time()-60)
         if seconds<1:raise ValueError('Absolute deadline has no execution and cleanup time remaining')

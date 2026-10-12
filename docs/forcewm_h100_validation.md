@@ -109,3 +109,23 @@ approximately31.1h remains before the original fixed deadline, below the
 existing36.19h start/save/eval budget estimate for a fresh30000-step run.
 Any later run needs an explicitly approved budget and a fresh bound plan/output;
 the old40h deadline must not be reset silently.
+
+
+## Oct12 approved recovery budget
+
+The user explicitly approved48h, cleanup of obsolete training containers, and
+automatic selection or queuing of four GPUs or an eight-GPU host. The recovery
+keeps four ranks/B16/accum1/global64/30000, with the original budget anchor
+Oct12 00:02:25 Shanghai and fixed extended deadline Oct14 00:02:25 Shanghai
+(Unix1791907345). A replacement allocation does not restart the48h clock.
+
+The separate `forcewm-recovery48h-v2` plan binds this exact authorization and
+retains the old v1 40h validation for historical plans. New source/config hashes,
+a fresh output directory and measured startup/save/eval budget fit are required.
+Eight visible GPUs do not authorize an eight-rank/global128 recipe. The legacy
+failed source, logs, receipts and complete feature cache stay unchanged.
+
+Targeted budget/process regression:29 cases passed, comprising8 new recovery
+authorization cases and21 existing guard/process cases. The unchanged model
+suite and14 already-passed exit-race cases were not rerun for this budget edit.
+No new GPU result follows from these CPU tests.

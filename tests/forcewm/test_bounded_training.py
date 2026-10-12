@@ -52,6 +52,29 @@ def plan(tmp_path):
 def test_valid_plan(plan):
     assert guard.validate_plan(plan,1100)==143840
 
+def recovery_plan(plan):
+    plan.update(schema='forcewm-recovery48h-v2',
+        original_budget_anchor_unix=1791734545,allocation_created_unix=1791767345,
+        deadline_unix=1791907345,
+        recovery_of_allocation_id='b2c145b8-a54c-46e0-8580-919ec0549792')
+    return plan
+
+def test_recovery_preserves_original_fixed_48h_deadline(plan):
+    p=recovery_plan(plan)
+    assert guard.validate_plan(p,1791767345)==139940
+
+@pytest.mark.parametrize('change',['reset_clock','anchor','allocation','future_created','nan_created','insufficient','eight_ranks'])
+def test_recovery_rejects_budget_reset_and_recipe_drift(plan,change):
+    p=recovery_plan(plan);now=1791767345
+    if change=='reset_clock':p['deadline_unix']=p['allocation_created_unix']+48*3600
+    elif change=='anchor':p['original_budget_anchor_unix']+=1
+    elif change=='allocation':p['recovery_of_allocation_id']='another-allocation'
+    elif change=='future_created':p['allocation_created_unix']=now+1
+    elif change=='nan_created':p['allocation_created_unix']=float('nan')
+    elif change=='insufficient':now+=14000
+    elif change=='eight_ranks':p['world_size']=8;p['global_batch']=128
+    with pytest.raises(ValueError):guard.validate_plan(p,now)
+
 @pytest.mark.parametrize('change',['deadline','budget','argv','environment','missing_binding','tamper','relaunch','nan','skipped','forced','bool_rc'])
 def test_reject_drift(plan,change):
     if change=='deadline':plan['deadline_unix']+=1
