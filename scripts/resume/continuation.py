@@ -22,6 +22,42 @@ def restore_rng(snapshot):
         torch.cuda.set_rng_state_all(cuda)
 
 
+def restore_saved_native_rng(trainer, state):
+    """Restore saved rank RNG after native load's post-load bookkeeping.
+
+    The strict verifier still checks every RNG, sampler and memory state.
+    Model/optimizer/scheduler verification remains independent of this restore.
+    """
+    rank = trainer.accelerator.process_index
+    saved = torch.load(state / f"random_states_{rank}.pkl", map_location="cpu", weights_only=False)
+    py, npy, cpu, cuda = rng_snapshot()
+    target_cpu = saved["torch_manual_seed"]
+    target_cuda = saved.get("torch_cuda_manual_seed", [])
+    if (not isinstance(target_cpu, torch.Tensor) or target_cpu.dtype != torch.uint8
+            or target_cpu.shape != cpu.shape or not isinstance(target_cuda, (list, tuple))
+            or len(target_cuda) != len(cuda)
+            or any(not isinstance(a, torch.Tensor) or a.dtype != torch.uint8 or a.shape != b.shape
+                   for a, b in zip(target_cuda, cuda))
+            or type(saved.get("step")) is not int or saved["step"] < 0):
+        raise ValueError("Invalid saved native RNG tensor/device/step structure")
+    # Validate CPU generators before changing the process-global generators.
+    random.Random().setstate(saved["random_state"])
+    np.random.RandomState().set_state(saved["numpy_random_seed"])
+    torch.Generator(device="cpu").set_state(target_cpu)
+    n = saved["numpy_random_seed"]
+    before = {
+        "python": py == saved["random_state"],
+        "numpy": npy[0] == n[0] and np.array_equal(npy[1], n[1]) and npy[2:] == n[2:],
+        "torch_cpu": torch.equal(cpu, target_cpu),
+        "torch_cuda": all(torch.equal(a, b.cpu()) for a, b in zip(cuda, target_cuda)),
+        "accelerator_step": trainer.accelerator.step == saved["step"],
+    }
+    restore_rng((saved["random_state"], n, target_cpu, [x.cpu() for x in target_cuda]))
+    trainer.accelerator.step = saved["step"]
+    return {"source": f"random_states_{rank}.pkl", "before_matches": before,
+            "restored_accelerator_step": saved["step"]}
+
+
 def verify_rng_and_sampler(trainer, state, progress):
     rank = trainer.accelerator.process_index
     saved = torch.load(state / f"random_states_{rank}.pkl", map_location="cpu", weights_only=False)

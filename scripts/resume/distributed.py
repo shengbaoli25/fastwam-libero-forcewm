@@ -119,8 +119,11 @@ def worker(args):
     model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=runtime._resolve_train_device())
     train_ds, val_ds = runtime.build_datasets(cfg.data)
     trainer = Wan22Trainer(model, train_ds, val_ds, cfg=cfg)
+    from continuation import restore_saved_native_rng
+    native_rng_restore = restore_saved_native_rng(trainer, args.state)
     from fastwam.forcewm.preflight import helpers
     restored = verify_restored(trainer, args.state, args.step, helpers())
+    restored["native_rng_restore"] = native_rng_restore
     engine = trainer.model
     if (engine.train_micro_batch_size_per_gpu(), engine.gradient_accumulation_steps(),
             engine.train_batch_size()) != (16, 1, 64):

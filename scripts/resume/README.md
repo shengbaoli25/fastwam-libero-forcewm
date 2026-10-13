@@ -74,3 +74,11 @@ Only all four `complete` origins, a final 30000 save (including the native final
 second save), and unforced whole-process-tree exit produce `completion.json`.
 CPU tests are not production GPU restore evidence. The first fresh four-rank
 formal-checkpoint restore is still pending until the original allocation stops.
+
+The distributed command must inherit the original shared component environment:
+`DIFFSYNTH_MODEL_BASE_PATH=$resume_hdd/realman-fastwam/checkpoints` and
+`DIFFSYNTH_SKIP_DOWNLOAD=true`. After native loading and its post-load bookkeeping,
+the resume entry explicitly restores Python/NumPy/Torch/CUDA RNG and Accelerate's
+accumulation step from each saved `random_states_<rank>.pkl`. It records which
+fields already matched before this final restoration. The unchanged strict
+RNG/sampler/memory verifier then runs; no mismatch is accepted as successful.
